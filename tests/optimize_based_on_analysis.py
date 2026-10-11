@@ -200,7 +200,7 @@ class EnhancedSubtitleAnalyzer:
 
                     # 使用容差来处理浮点数精度问题
                     tolerance = 1e-3  # 1毫秒的容差，更实用的精度
-                    if gap < (self.rules['min_gap'] - tolerance) and gap >= 0:  # 负值表示重叠，单独处理
+                    if gap < 0 or gap < (self.rules['min_gap'] - tolerance):
                         violations['gap_too_small'].append({
                             'number': subtitle['number'],
                             'next_number': next_subtitle['number'],

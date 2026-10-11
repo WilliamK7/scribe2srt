@@ -450,16 +450,18 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result[2], original.text.strip())
         self.assertEqual(result[3], translated.translation)
 
-    def test_disabled_matches_original_renderer_for_all_repository_samples(self):
+    def test_disabled_matches_reviewed_renderer_for_all_repository_samples(self):
         root = Path(__file__).resolve().parents[1]
         hashes = json.loads((root / "tests" / "fixtures" / "legacy_srt_hashes.json").read_text(encoding="utf-8"))
         for path in sorted((root / "sample").glob("*.json")):
             with self.subTest(sample=path.name):
                 data = json.loads(path.read_text(encoding="utf-8"))
+                original = copy.deepcopy(data)
                 content = create_srt_from_json(copy.deepcopy(data))
                 self.assertEqual(hashlib.sha256(content.encode("utf-8")).hexdigest(), hashes[path.name])
                 process_subtitles(data, self.source, {"translation_enabled": False})
                 self.assertEqual(self.output.read_text(encoding="utf-8"), content)
+                self.assertEqual(data, original)
 
     def test_failure_and_cancellation_preserve_existing_srt(self):
         self.output.write_text("EXISTING SRT", encoding="utf-8")

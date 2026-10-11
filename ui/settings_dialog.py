@@ -38,6 +38,7 @@ class SettingsDialog(QDialog):
         self.min_duration_spin.setRange(0.5, 3.0)
         self.min_duration_spin.setSuffix(" 秒")
         self.min_duration_spin.setValue(current_settings.get("min_subtitle_duration", DEFAULT_SUBTITLE_SETTINGS["min_subtitle_duration"]))
+        self.min_duration_spin.setToolTip("优先避免字幕重叠，时间冲突时可能缩短最短显示时间。")
 
         # 最长显示时间
         self.max_duration_spin = QDoubleSpinBox()
@@ -54,10 +55,14 @@ class SettingsDialog(QDialog):
         self.min_gap_spin.setRange(0.01, 1.0)
         self.min_gap_spin.setSuffix(" 秒")
         self.min_gap_spin.setValue(current_settings.get("min_subtitle_gap", DEFAULT_SUBTITLE_SETTINGS["min_subtitle_gap"]))
+        self.min_gap_spin.setToolTip("尽量保留设定间隔；时间不足时可缩小至零，每条字幕至少显示 1 毫秒。")
 
         subtitle_layout.addRow("字幕最短显示时间:", self.min_duration_spin)
         subtitle_layout.addRow("字幕最长显示时间:", self.max_duration_spin)
         subtitle_layout.addRow("字幕间最小间隔:", self.min_gap_spin)
+        timing_note = QLabel("时间冲突时优先避免重叠，最短显示时间和字幕间隔可能被缩短。")
+        timing_note.setWordWrap(True)
+        subtitle_layout.addRow(timing_note)
         subtitle_group.setLayout(subtitle_layout)
 
         # === CPS设置组（每秒字符数）===

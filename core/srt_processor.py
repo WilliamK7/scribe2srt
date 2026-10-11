@@ -6,7 +6,6 @@ SRT字幕处理器模块
 使用新的两阶段算法：基于标点符号的句子预分割 + 智能合并
 """
 
-import datetime
 from dataclasses import dataclass
 import re
 from typing import Dict, List, Optional
@@ -33,13 +32,17 @@ def single_line(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _seconds_to_milliseconds(seconds: float) -> int:
+    """Round to the nearest nonnegative millisecond for timeline and rendering."""
+    return max(0, int(round(seconds * 1000)))
+
+
 def format_srt_time(seconds: float) -> str:
     """Convert seconds to SRT time format (HH:MM:SS,mmm)."""
-    td = datetime.timedelta(seconds=seconds)
-    hours, remainder = divmod(td.total_seconds(), 3600)
+    total_seconds, milliseconds = divmod(_seconds_to_milliseconds(seconds), 1000)
+    hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
-    milliseconds = int((seconds % 1) * 1000)
-    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d},{milliseconds:03d}"
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
 class SrtProcessor:
@@ -137,9 +140,10 @@ class SrtProcessor:
         self.words = []
         self.audio_events = []  # 独立存储音频事件
 
-        for word_info in raw_words:
+        for source_index, word_info in enumerate(raw_words):
             # Splitting must never mutate the original transcription JSON.
             word_info = word_info.copy()
+            word_info['_source_index'] = source_index
             # 首先检查是否为音频事件类型
             if word_info.get('type') == 'audio_event':
                 self.audio_events.append(word_info.copy())
@@ -198,7 +202,7 @@ class SrtProcessor:
         1. Sentence-level pre-splitting based on punctuation priority (only for word types)
         2. Independent audio_event processing
         3. Intelligent merging based on CPS, CPL, and display time rules
-        4. Final integration and sorting
+        4. Final integration, millisecond timeline correction and numbering
         """
         if not self.words and not self.audio_events:
             return []
@@ -231,13 +235,54 @@ class SrtProcessor:
             merged_entries = intelligent_merger.merge_basic_entries(basic_entries)
             merged_entries = intelligent_merger.optimize_merged_entries(merged_entries)
 
-        # Stage 4: Combine and sort all entries (word-based + audio events)
-        all_entries = merged_entries + audio_event_entries
-        all_entries.sort(key=lambda x: x['start'])  # 按时间顺序排序
+        # Correct the complete timeline before numbering or translation.
+        return self._finalize_entries(merged_entries + audio_event_entries)
 
-        return [SubtitleEntry(i, entry['start'], entry['end'], entry['text'],
-                              entry.get('is_audio_event', False))
-                for i, entry in enumerate(all_entries, 1)]
+    def _finalize_entries(self, entries: List[Dict]) -> List[SubtitleEntry]:
+        """Keep all text and speech starts while making every cue non-overlapping."""
+        timed_entries = []
+        for position, entry in enumerate(entries):
+            source_index = min(
+                (word['_source_index'] for word in entry.get('words', [])
+                 if '_source_index' in word),
+                default=position,
+            )
+            timed_entries.append((
+                _seconds_to_milliseconds(entry['start']), source_index, entry,
+            ))
+        # Stable source order also applies when different floats round to one start.
+        timed_entries.sort(key=lambda item: (item[0], item[1]))
+
+        groups = []
+        for start_ms, _, entry in timed_entries:
+            end_ms = _seconds_to_milliseconds(entry['end'])
+            if groups and groups[-1]['start'] == start_ms:
+                group = groups[-1]
+                group['text'] += ' ' + entry['text']
+                group['end'] = max(group['end'], end_ms)
+                group['is_audio_event'] &= entry.get('is_audio_event', False)
+            else:
+                groups.append({
+                    'start': start_ms,
+                    'end': end_ms,
+                    'text': entry['text'],
+                    'is_audio_event': entry.get('is_audio_event', False),
+                })
+
+        gap_ms = _seconds_to_milliseconds(self.min_subtitle_gap)
+        finalized = []
+        for index, group in enumerate(groups):
+            start_ms = group['start']
+            end_ms = max(start_ms + 1, group['end'])
+            if index + 1 < len(groups):
+                next_start_ms = groups[index + 1]['start']
+                # Prefer the requested gap; reduce it only to retain at least 1 ms.
+                end_ms = min(end_ms, max(start_ms + 1, next_start_ms - gap_ms))
+            finalized.append(SubtitleEntry(
+                index + 1, start_ms / 1000, end_ms / 1000,
+                group['text'], group['is_audio_event'],
+            ))
+        return finalized
 
     def render_entries(self, entries: List[SubtitleEntry]) -> str:
         """Render translations as exactly two lines, preserving entry structure."""
@@ -267,11 +312,7 @@ class SrtProcessor:
         Returns:
             Final SRT content string
         """
-        return self.render_entries([
-            SubtitleEntry(i, entry['start'], entry['end'], entry['text'],
-                          entry.get('is_audio_event', False))
-            for i, entry in enumerate(entries, 1)
-        ])
+        return self.render_entries(self._finalize_entries(entries))
     
     def _optimize_text_display(self, text: str) -> str:
         """

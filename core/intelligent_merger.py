@@ -295,31 +295,9 @@ class IntelligentMerger:
         Returns:
             优化后的条目列表
         """
-        if not merged_entries:
-            return []
-
-        optimized_entries = []
-
-        for i, entry in enumerate(merged_entries):
-            optimized_entry = self._optimize_single_entry(entry)
-
-            # 确保与下一个字幕的时间间隔
-            if i + 1 < len(merged_entries):
-                next_entry = merged_entries[i + 1]
-                gap = next_entry['start'] - optimized_entry['end']
-
-                if gap < self.min_subtitle_gap:
-                    # 调整当前字幕的结束时间
-                    optimized_entry['end'] = next_entry['start'] - self.min_subtitle_gap
-
-                    # 确保不会导致时长过短
-                    min_end_time = optimized_entry['start'] + self.min_subtitle_duration
-                    if optimized_entry['end'] < min_end_time:
-                        optimized_entry['end'] = min_end_time
-
-            optimized_entries.append(optimized_entry)
-
-        return optimized_entries
+        # Duration/CPS optimization precedes the final dialogue + audio-event
+        # timeline correction in SrtProcessor. Never extend cues after that pass.
+        return [self._optimize_single_entry(entry) for entry in merged_entries]
 
     def _optimize_single_entry(self, entry: Dict) -> Dict:
         """优化单个条目"""
