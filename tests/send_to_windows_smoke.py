@@ -49,13 +49,33 @@ def shell_launch(shortcut, files):
     return request.hProcess
 
 
-def wait_for_exit(handle, timeout=30):
+def terminate_process_tree(pid):
+    """Kill only the timed-out process we launched and its bundle children."""
+    subprocess.run(["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+                   capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def run_direct(command, cwd, env=None):
+    with subprocess.Popen(command, cwd=cwd, env=env,
+                          creationflags=subprocess.CREATE_NO_WINDOW) as process:
+        try:
+            code = process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(process.pid)
+            process.wait(timeout=10)
+            raise AssertionError("Direct SendTo process did not automatically exit")
+    assert code == 0, f"SendTo process exited with {code}"
+
+
+def wait_for_exit(handle, timeout=60):
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel.WaitForSingleObject.restype = wintypes.DWORD
     kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     kernel.GetExitCodeProcess.restype = wintypes.BOOL
     kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessId.restype = wintypes.DWORD
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     deadline = time.monotonic() + timeout
     try:
@@ -67,7 +87,7 @@ def wait_for_exit(handle, timeout=30):
                 if code.value:
                     raise AssertionError(f"SendTo process exited with {code.value}")
                 return
-        kernel.TerminateProcess(handle, 1)
+        terminate_process_tree(kernel.GetProcessId(handle))
         kernel.WaitForSingleObject(handle, 3000)
         raise AssertionError("SendTo process did not automatically exit")
     finally:
@@ -82,20 +102,24 @@ def fixture(path):
     return path.read_bytes()
 
 
-def check_files(paths, originals):
+def check_files(paths, originals, expected="繁體中文"):
     for path, original in zip(paths, originals):
         assert path.read_bytes() == original, f"source JSON changed: {path}"
         subtitle = path.with_suffix(".srt").read_text(encoding="utf-8")
-        assert "繁體中文" in subtitle, f"saved translation_enabled=false was not loaded: {subtitle}"
+        assert expected in subtitle, f"unexpected subtitle text: {subtitle}"
         assert "-->" in subtitle, f"subtitle not replaced: {path}"
+        for suffix in (".transcription-cache.json", ".translation-cache.json"):
+            assert not path.with_suffix(suffix).exists(), f"task cache left behind: {path}"
 
 
-def run_smoke(executable):
+def run_smoke(executable, send_to_directory=None):
     if sys.platform != "win32":
         raise RuntimeError("This smoke test requires Windows")
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
-    send_to = Path(integration._run_powershell(
-        "[Console]::WriteLine([Environment]::GetFolderPath([Environment+SpecialFolder]::SendTo))\n"))
+    send_to = (Path(send_to_directory).resolve() if send_to_directory is not None else
+               Path(integration._run_powershell(
+                   "[Console]::WriteLine([Environment]::GetFolderPath([Environment+SpecialFolder]::SendTo))\n")))
+    send_to.mkdir(parents=True, exist_ok=True)
     shortcut = send_to / integration.SHORTCUT_NAME
     previous = shortcut.read_bytes() if shortcut.exists() else None
     with tempfile.TemporaryDirectory(prefix="Scribe2SRT 发送到 '") as temporary:
@@ -124,10 +148,10 @@ def run_smoke(executable):
         try:
             for name, spec in specs:
                 with patch.object(integration, "shortcut_spec", return_value=spec):
-                    integration.add_send_to_shortcut()
+                    integration.add_send_to_shortcut(directory=send_to_directory)
                     installed = True
                     modified = True
-                    integration.add_send_to_shortcut()  # Update the existing shortcut.
+                    integration.add_send_to_shortcut(directory=send_to_directory)  # Update it.
                 for count in (1, 3):
                     paths = [inputs / f"{name} 中文 空格 {count}-{number}.json" for number in range(count)]
                     originals = [fixture(path) for path in paths]
@@ -137,24 +161,41 @@ def run_smoke(executable):
                 direct = inputs / f"{name} different cwd.json"
                 original = fixture(direct)
                 command = ([pythonw, str(source / "app.py")] if name == "source" else [spec.target])
-                result = subprocess.run(command + ["--send-to", "--", str(direct)], cwd=inputs, timeout=30,
-                                        creationflags=subprocess.CREATE_NO_WINDOW)
-                assert result.returncode == 0, result.returncode
+                run_direct(command + ["--send-to", "--", str(direct)], cwd=inputs)
                 check_files([direct], [original])
                 print(f"{name}: different working directory settings OK", flush=True)
-            integration.remove_send_to_shortcut()
+            integration.remove_send_to_shortcut(directory=send_to_directory)
             assert not shortcut.exists(), "shortcut removal failed"
             installed = False
         finally:
             if installed:
-                integration.remove_send_to_shortcut()
+                integration.remove_send_to_shortcut(directory=send_to_directory)
             if previous is not None and modified:
                 shortcut.write_bytes(previous)
+        # Default configuration must work without credentials or external runtimes.
+        assert not (executable.parent / "settings.json").exists(), "default smoke requires a clean bundle"
+        default_input = inputs / "默认 配置 繁体.json"
+        original = fixture(default_input)
+        environment = os.environ.copy()
+        # Only Windows system tools remain available, never Python or FFmpeg.
+        windows = Path(os.environ["SystemRoot"])
+        environment["PATH"] = os.pathsep.join(str(windows / part) for part in
+                                              ("System32", "System32/WindowsPowerShell/v1.0"))
+        for program in ("python", "pythonw", "ffmpeg", "ffprobe"):
+            assert shutil.which(program, path=environment["PATH"]) is None, program
+        run_direct([str(executable), "--send-to", "--", str(default_input)],
+                   cwd=inputs, env=environment)
+        check_files([default_input], [original], expected="这个字幕是繁体中文")
+        assert "繁體中文" not in default_input.with_suffix(".srt").read_text(encoding="utf-8")
+        assert not (executable.parent / "settings.json").exists(), "smoke wrote default configuration"
+        print("bundle: default Chinese/OpenCC, no keys/Python/FFmpeg, different cwd OK", flush=True)
     print("Windows source/bundle SendTo smoke: OK", flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--executable", required=True, type=Path)
+    parser.add_argument("--send-to-directory", type=Path,
+                        help="Use an isolated shortcut directory instead of the user's SendTo folder")
     args = parser.parse_args()
-    run_smoke(args.executable.resolve(strict=True))
+    run_smoke(args.executable.resolve(strict=True), args.send_to_directory)

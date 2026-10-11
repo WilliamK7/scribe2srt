@@ -2,6 +2,8 @@
 
 Scribe2SRT 是一款专业的音视频转字幕工具。通过集成 ElevenLabs 语音识别技术和智能字幕分割算法，让字幕制作变得简单高效。
 
+本仓库是 [cylind/scribe2srt](https://github.com/cylind/scribe2srt) 的公开 Fork，保留上游提交历史和全部样本，并提供 Windows x64 便携版。
+
 ## 🚀 主要特性
 
 - 🎯 **高质量转录**：基于 ElevenLabs 先进的语音识别技术
@@ -15,10 +17,12 @@ Scribe2SRT 是一款专业的音视频转字幕工具。通过集成 ElevenLabs 
 
 ## 💻 安装使用
 
-### 快速开始
-1. 前往 [Releases 页面](https://github.com/cylind/scribe2srt/releases) 下载最新版本
-2. 解压后直接运行程序
-3. **推荐安装 FFmpeg**：用于视频文件处理，提升兼容性和处理效率
+### Windows x64 便携版
+
+1. 前往 [Releases 页面](https://github.com/WilliamK7/scribe2srt/releases) 下载 Windows ZIP；同页提供 `.sha256` 校验文件。
+2. **完整解压到可写目录**，运行 `Scribe2SRT.exe`，无需安装 Python。设置保存在 EXE 旁的 `settings.json`；`settings.example.json` 是无密钥示例。
+3. **自动翻译默认开启**：处理外语前填写 Qwen API Key，或先关闭“自动翻译为简体中文”。标记为中文的 JSON 使用本地 OpenCC 繁转简，无需密钥。
+4. **视频处理推荐安装 FFmpeg**：将 `ffmpeg` 和 `ffprobe` 一起加入 PATH。FFmpeg 不随 ZIP 分发；本地中文 JSON 处理无需 FFmpeg。
 
 <details>
 <summary>从源码运行（点击展开）</summary>
@@ -26,13 +30,14 @@ Scribe2SRT 是一款专业的音视频转字幕工具。通过集成 ElevenLabs 
 #### 安装步骤
 1. **下载项目**
    ```bash
-   git clone https://github.com/your-username/scribe2srt.git
+   git clone https://github.com/WilliamK7/scribe2srt.git
    cd scribe2srt
    ```
 
 2. **安装依赖**
+   推荐 Python 3.11；Windows 发布验证使用 3.11 x64。可先创建独立虚拟环境。
    ```bash
-   pip install -r requirements.txt
+   python -m pip install -r requirements.txt
    ```
 
 3. **运行程序**
@@ -138,19 +143,23 @@ API Key 按本机配置明文保存到 `settings.json`，界面遮罩显示且�
 python -m unittest discover -s tests -t . -p "test_*.py" -v
 ```
 
-发布流程通过 `--collect-data opencc` 收集繁简转换字典；本地打包也需添加该选项：
-
-```bash
-pyinstaller --onefile --windowed --noconsole --name Scribe2SRT --collect-data opencc app.py
-```
-
-Windows 下还可用离线 JSON 验证真实 Shell 快捷方式的添加、更新、移除、源码版及打包版的单文件／多文件启动，以及不同工作目录的配置加载：
+正式 Windows 构建使用精确版本的 `requirements-build.txt`。在 Python 3.11 x64 环境中运行：
 
 ```powershell
-python tests/send_to_windows_smoke.py --executable dist/Scribe2SRT.exe
+./scripts/build_windows.ps1 -Python python
 ```
 
-该检查使用临时程序和输入副本，会临时更新当前用户的本程序快捷方式，并在结束时恢复原内容；同名但不属于本程序的快捷方式会拒绝覆盖。发布流程包含离线测试和 Windows 快捷方式检查。
+脚本依次安装固定依赖、检查依赖、运行离线测试、构建 EXE、附带许可证、生成 ZIP，并解压验证后生成 SHA-256。构建收集 OpenCC 数据、Qt Windows 插件和 HTTPS 证书；打包钩子过滤应用未使用的虚拟键盘及 PDF 插件。
+
+Windows 下也可用离线 JSON 单独验证真实 Shell 快捷方式的添加、更新、移除、源码版及打包版的单文件／多文件启动、不同工作目录的配置加载，以及最终 EXE 在无密钥、无 Python/FFmpeg 环境下的默认繁转简：
+
+```powershell
+python tests/send_to_windows_smoke.py --executable dist/Scribe2SRT.exe --send-to-directory build/smoke-sendto
+```
+
+传入 `--send-to-directory` 时，快捷方式操作全部使用指定隔离目录。省略该选项会临时更新当前用户的本程序快捷方式，并在结束时恢复原内容；同名但不属于本程序的快捷方式会拒绝覆盖。默认配置检查要求被测 EXE 旁没有 `settings.json`。所有应用烟雾测试子进程最多等待 60 秒。
+
+推送 `main`、面向 `main` 的 PR 和手动触发都会构建并上传验证包；仅本 Fork 的 `v*` 标签推送在验证成功后创建正式 Release。详细构建、上线和失败重试步骤见 [Windows 发布操作](docs/windows-release.md)。
 
 尚未使用真实凭据验证默认 10 条组批在 Qwen-MT 上的编号保留率、拆批频率及语义串句情况。实际使用时建议先用少量英、日、韩字幕比较每批 1 条与 10 条的译文。
 
@@ -164,7 +173,9 @@ python tests/send_to_windows_smoke.py --executable dist/Scribe2SRT.exe
 
 ## 📄 许可证
 
-本项目采用 MIT 许可证。
+上游 README 声明本项目采用 MIT 许可证，本 Fork 保留该声明、原作者提交历史和样本。当前审计的上游修订没有独立 LICENSE 文件，未补写或推测原作者版权信息。
+
+Windows ZIP 附带第三方组件的版本、原始许可证及 NOTICE；Qt/PySide6、OpenCC 等组件保留各自许可及署名。详见 [第三方声明](third_party/THIRD_PARTY_NOTICES.md)。
 
 ---
 
