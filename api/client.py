@@ -45,7 +45,7 @@ def _random_ip() -> str:
 
 BASE_HEADERS = {
     "accept": "*/*",
-    "accept-encoding": "gzip, deflate, br, zstd",
+    "accept-encoding": "gzip, deflate",
     "origin": "https://elevenlabs.io",
     "referer": "https://elevenlabs.io/",
     "sec-fetch-dest": "empty",
