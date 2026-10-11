@@ -11,7 +11,7 @@ import ctypes
 from typing import Optional, Dict, Any, List
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTextEdit, QFileDialog, QMessageBox, QComboBox, QProgressBar
 )
 from PySide6.QtCore import QThread, Qt, QThreadPool, QTimer
@@ -27,6 +27,8 @@ from core.ffmpeg_utils import is_ffmpeg_available, extract_audio, get_media_info
 from api.translation_client import RequestRateLimiter
 from core.atomic_io import atomic_write_text
 from core.translation import translation_cache_path
+from core.launch import absolute_path, path_key
+from core.windows_integration import add_send_to_shortcut, remove_send_to_shortcut, IntegrationError
 from .widgets import CustomCheckBox
 from .settings_dialog import SettingsDialog
 from .async_settings_dialog import AsyncSettingsDialog
@@ -53,7 +55,7 @@ class MainWindow(QMainWindow):
     应用程序的主窗口。
     管理UI交互，并将处理任务委托给后台Worker。
     """
-    def __init__(self):
+    def __init__(self, started_from_send_to=False):
         super().__init__()
         self.setWindowTitle("Scribe -> SRT (Powered by ElevenLabs)")
         self.setGeometry(100, 100, 750, 600)
@@ -74,6 +76,22 @@ class MainWindow(QMainWindow):
         
         # 用于重试逻辑的状态存储
         self._pending_retry_state: Optional[Dict[str, Any]] = None
+        self.started_from_send_to = started_from_send_to
+        self._queue_active = False
+        self._queue_external = False
+        self._queue_options = None
+        self._queue_rate_limiter = None
+        self._queued_keys = set()
+        self._queue_revision = 0
+        self._current_result_recorded = False
+        self._cancelling = False
+        self._keep_open = False
+        self._settings_errors = []
+        self._notice_boxes = []
+        self._before_auto_close = None
+        self._auto_exit_timer = QTimer(self)
+        self._auto_exit_timer.setSingleShot(True)
+        self._auto_exit_timer.timeout.connect(self._try_auto_exit)
         
         self.load_settings()
         self.translation_rate_limiter = RequestRateLimiter(
@@ -83,6 +101,9 @@ class MainWindow(QMainWindow):
         
         self.ffmpeg_available = self._check_ffmpeg()
         self._connect_signals()
+        for message in self._settings_errors:
+            self._report_settings_error(message)
+        self._settings_errors.clear()
 
     def setup_ui(self):
         """初始化和布局UI控件。"""
@@ -110,10 +131,11 @@ class MainWindow(QMainWindow):
         self.lang_label = QLabel("源语言:")
         self.lang_combo = QComboBox()
         self.lang_combo.addItems(LANGUAGES.keys())
-        self.lang_combo.setCurrentText("自动检测")
+        self.lang_combo.setCurrentText(next(
+            name for name, code in LANGUAGES.items() if code == self.settings["source_language"]))
         
         self.audio_events_checkbox = CustomCheckBox("识别声音事件")
-        self.audio_events_checkbox.setChecked(False)
+        self.audio_events_checkbox.setChecked(self.settings["tag_audio_events"])
 
         self.async_settings_button = QPushButton("并发处理设置")
         self.settings_button = QPushButton("字幕设置")
@@ -171,6 +193,10 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.log_area)
         
         self.setCentralWidget(container)
+        if sys.platform == "win32":
+            self.integration_menu = self.menuBar().addMenu("系统集成")
+            self.integration_menu.addAction("添加到发送到", self._add_send_to)
+            self.integration_menu.addAction("从发送到移除", self._remove_send_to)
 
     def _connect_signals(self):
         """连接所有UI控件的信号到槽函数。"""
@@ -181,6 +207,35 @@ class MainWindow(QMainWindow):
         self.settings_button.clicked.connect(self.open_settings_dialog)
         self.translation_settings_button.clicked.connect(self.open_translation_settings_dialog)
         self.translation_checkbox.toggled.connect(self._translation_toggled)
+        self.lang_combo.currentTextChanged.connect(self._source_language_changed)
+        self.audio_events_checkbox.toggled.connect(self._audio_events_toggled)
+
+    def _show_notice(self, title, message, icon=QMessageBox.Icon.Information):
+        box = QMessageBox(icon, title, message, QMessageBox.StandardButton.Ok, self)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._notice_boxes.append(box)
+        box.finished.connect(lambda _: self._notice_boxes.remove(box))
+        box.open()
+
+    def _add_send_to(self):
+        try:
+            path = add_send_to_shortcut()
+            message = f"已添加或更新“发送到 → Scribe2SRT”：\n{path}"
+            self.log_area.append(message)
+            self._show_notice("系统集成", message)
+        except IntegrationError as exc:
+            self.log_area.append(f"❌ {exc}")
+            self._show_notice("系统集成失败", str(exc), QMessageBox.Icon.Critical)
+
+    def _remove_send_to(self):
+        try:
+            path = remove_send_to_shortcut()
+            message = f"已移除本程序的“发送到”快捷方式：\n{path}"
+            self.log_area.append(message)
+            self._show_notice("系统集成", message)
+        except IntegrationError as exc:
+            self.log_area.append(f"❌ {exc}")
+            self._show_notice("系统集成失败", str(exc), QMessageBox.Icon.Critical)
 
     def _apply_dark_mode_title_bar(self):
         """(仅Windows) 尝试设置窗口标题栏为暗色模式。"""
@@ -213,6 +268,8 @@ class MainWindow(QMainWindow):
         # 使用新的默认设置结构（移除pause_threshold）
         self.settings = {
             **DEFAULT_TRANSLATION_SETTINGS,
+            "source_language": "auto",
+            "tag_audio_events": False,
             # 基础设置
             "split_duration_min": DEFAULT_SPLIT_DURATION_MIN,
 
@@ -236,13 +293,23 @@ class MainWindow(QMainWindow):
             "api_rate_limit_per_minute": 30,
         }
 
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                    loaded_settings = json.load(f)
-                    self.settings.update(loaded_settings)
-            except (json.JSONDecodeError, TypeError):
-                print(f"警告: 无法解析 {SETTINGS_FILE}。将使用默认设置。")
+        try:
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                loaded_settings = json.load(f)
+                if not isinstance(loaded_settings, dict):
+                    raise ValueError("配置内容必须是 JSON 对象")
+                self.settings.update(loaded_settings)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError) as exc:
+            self._report_settings_error(f"无法读取设置文件 {SETTINGS_FILE}：{exc}。使用默认设置。")
+
+        if self.settings["source_language"] not in LANGUAGES.values():
+            self._report_settings_error("设置中的源语言无效，已改为自动检测。")
+            self.settings["source_language"] = "auto"
+        if not isinstance(self.settings["tag_audio_events"], bool):
+            self._report_settings_error("设置中的声音事件开关无效，已关闭。")
+            self.settings["tag_audio_events"] = False
 
         # 为了向后兼容，保留这些属性（移除pause_threshold）
         self.max_subtitle_duration = self.settings["max_subtitle_duration"]
@@ -250,7 +317,28 @@ class MainWindow(QMainWindow):
 
     def save_settings(self):
         """保存当前设置到文件。"""
-        atomic_write_text(SETTINGS_FILE, json.dumps(self.settings, ensure_ascii=False, indent=4))
+        try:
+            atomic_write_text(SETTINGS_FILE, json.dumps(self.settings, ensure_ascii=False, indent=4))
+            return True
+        except (OSError, ValueError, TypeError) as exc:
+            self._report_settings_error(f"无法保存设置文件 {SETTINGS_FILE}：{exc}。本次修改尚未保存。")
+            return False
+
+    def _report_settings_error(self, message):
+        self._keep_open = True
+        if hasattr(self, "log_area"):
+            self.log_area.append(f"❌ {message}")
+            self._show_notice("设置文件错误", message, QMessageBox.Icon.Critical)
+        else:
+            self._settings_errors.append(message)
+
+    def _source_language_changed(self, name):
+        self.settings["source_language"] = LANGUAGES.get(name, "auto")
+        self.save_settings()
+
+    def _audio_events_toggled(self, enabled):
+        self.settings["tag_audio_events"] = enabled
+        self.save_settings()
 
     def _translation_toggled(self, enabled):
         self.settings["translation_enabled"] = enabled
@@ -300,12 +388,17 @@ class MainWindow(QMainWindow):
     # --- 文件处理与UI状态 ---
     def set_files(self, file_paths: Optional[List[str]]):
         """设置当前要处理的文件并更新UI。"""
+        if self._queue_active:
+            return
         self.selected_file_paths = []
         self.current_processing_file = None
 
         if file_paths:
-            valid_paths = [path for path in file_paths if path and os.path.exists(path)]
-            self.selected_file_paths = valid_paths
+            keys = set()
+            for path in file_paths:
+                if path and os.path.isfile(path) and path_key(path) not in keys:
+                    keys.add(path_key(path))
+                    self.selected_file_paths.append(absolute_path(path))
 
         if self.selected_file_paths:
             if len(self.selected_file_paths) == 1:
@@ -346,6 +439,8 @@ class MainWindow(QMainWindow):
         self.settings_button.setEnabled(enabled)
         self.translation_checkbox.setEnabled(enabled)
         self.translation_settings_button.setEnabled(enabled)
+        if hasattr(self, "integration_menu"):
+            self.integration_menu.setEnabled(enabled)
         self.setAcceptDrops(enabled)
 
     def reset_ui_after_task(self):
@@ -359,28 +454,92 @@ class MainWindow(QMainWindow):
     # --- 核心处理流程 ---
     def start_process(self):
         """开始处理选定的文件。"""
+        if self._queue_active:
+            return
         if not self.selected_file_paths:
             QMessageBox.warning(self, "警告", "请先选择至少一个文件！")
             return
 
-        self.batch_queue = list(self.selected_file_paths)
-        self.batch_mode = len(self.batch_queue) > 1
+        self._start_queue(self.selected_file_paths)
+
+    def _start_queue(self, files, external=False, input_errors=None):
+        self._auto_exit_timer.stop()
+        self._queue_active = True
+        self._queue_external = external
+        self.batch_queue = list(files)
+        self._queued_keys = {path_key(path) for path in files}
+        self.batch_mode = external or len(self.batch_queue) > 1
         self.batch_cancelled = False
-        self.batch_results = []
+        self.batch_results = list(input_errors or [])
         self.current_batch_index = -1
         self.current_processing_file = None
+        self._current_result_recorded = False
         self.temp_audio_file = None
         self.upload_complete_logged = False
+        self._queue_options = dict(self.settings)
+        self._queue_options["source_language"] = LANGUAGES.get(self.lang_combo.currentText(), "auto")
+        self._queue_options["tag_audio_events"] = self.audio_events_checkbox.isChecked()
+        self._queue_rate_limiter = self.translation_rate_limiter
+        self._queue_revision += 1
 
         if self.batch_mode:
             self.log_area.append("=" * 50)
             self.log_area.append(f"开始批量处理，共 {len(self.batch_queue)} 个文件。")
 
         self.set_ui_enabled(False)
-        self._process_next_batch_file()
+        # Return to Qt first: the window is ready and IPC can acknowledge acceptance.
+        QTimer.singleShot(0, self._process_next_batch_file)
+
+    def handle_launch_request(self, send_to, files):
+        result = self.enqueue_external_files(files) if send_to else {"ok": True}
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        return result
+
+    def enqueue_external_files(self, file_paths):
+        """Append without changing the current worker, retry state or queue options."""
+        if self._cancelling:
+            message = "任务正在取消，请稍后重新发送文件。"
+            self.log_area.append(f"⚠️ {message}")
+            return {"ok": False, "error": message}
+        self._auto_exit_timer.stop()
+        valid, errors, duplicates = [], [], 0
+        keys = set(self._queued_keys)
+        for value in file_paths:
+            path = absolute_path(value)
+            if not os.path.isfile(path):
+                reason = "文件夹不支持发送到（不会递归扫描）" if os.path.isdir(path) else "文件不存在或无法访问"
+                errors.append({"file": path, "status": "error", "message": reason})
+                self.log_area.append(f"❌ 输入错误：{path}：{reason}")
+                self._keep_open = True
+                continue
+            key = path_key(path)
+            if key in keys:
+                duplicates += 1
+                continue
+            keys.add(key)
+            valid.append(path)
+        if self._queue_active:
+            self._queue_external = True
+            self.batch_mode = True
+            self.batch_queue.extend(valid)
+            self._queued_keys.update(path_key(path) for path in valid)
+            self.batch_results.extend(errors)
+            self._queue_revision += 1
+            # A manual completion dialog may already be running a nested Qt loop.
+            dialog = QApplication.activeModalWidget()
+            if isinstance(dialog, QMessageBox) and dialog.parentWidget() is self:
+                dialog.reject()
+        else:
+            self._start_queue(valid, external=True, input_errors=errors)
+        self.log_area.append(f"收到发送到任务：加入 {len(valid)} 个文件，忽略 {duplicates} 个正在处理或等待的重复文件。")
+        return {"ok": True, "accepted": len(valid), "duplicates": duplicates, "errors": len(errors)}
 
     def _process_next_batch_file(self):
         """处理待处理队列中的下一个文件。"""
+        if not self._queue_active or self.thread is not None or self._pending_retry_state:
+            return
         if self.batch_cancelled:
             self._finish_batch_processing()
             return
@@ -392,6 +551,7 @@ class MainWindow(QMainWindow):
 
         file_path = self.batch_queue[self.current_batch_index]
         self.current_processing_file = file_path
+        self._current_result_recorded = False
         display_name = os.path.basename(file_path)
 
         if self.batch_mode:
@@ -420,10 +580,17 @@ class MainWindow(QMainWindow):
         self.temp_audio_file = None
 
         _, ext = os.path.splitext(file_path)
-        if ext.lower() == '.json':
-            self._process_json_file_directly(file_path, from_batch=self.batch_mode)
-        else:
-            self._begin_media_processing(file_path)
+        try:
+            if not os.path.isfile(file_path):
+                raise OSError(f"文件不存在或无法访问：{file_path}")
+            if ext.lower() == '.json':
+                self._process_json_file_directly(file_path, from_batch=self.batch_mode)
+            else:
+                self._begin_media_processing(file_path)
+        except Exception as exc:
+            self.on_task_error(f"准备文件失败：{exc}")
+            if self.thread is None or not self.thread.isRunning():
+                self._handle_task_completion()
 
     def _begin_media_processing(self, source_file: str):
         """准备并启动音视频文件的处理流程。"""
@@ -451,16 +618,8 @@ class MainWindow(QMainWindow):
 
                 if not codec:
                     error_msg = "无法检测到视频中的音频编码，无法继续提取。"
-                    if self.batch_mode:
-                        self.log_area.append(f"\n❌ {error_msg}")
-                        self._record_batch_result("error", error_msg)
-                        self._finalize_current_batch_step()
-                    else:
-                        self.on_task_error(error_msg)
-                        self.set_ui_enabled(True)
-                        self.segmented_progress_bar.setVisible(False)
-                        self.progress_label.setVisible(False)
-                        self.progress_label.setText("")
+                    self.on_task_error(error_msg)
+                    self._handle_task_completion()
                     return
 
                 extension = CODEC_EXTENSION_MAP.get(codec, DEFAULT_AUDIO_EXTENSION)
@@ -472,16 +631,8 @@ class MainWindow(QMainWindow):
                 self.log_area.append("正在提取音频...")
                 if not extract_audio(source_file, temp_audio_path, self.log_area.append):
                     error_msg = "音频提取失败。"
-                    if self.batch_mode:
-                        self.log_area.append(f"\n❌ {error_msg}")
-                        self._record_batch_result("error", error_msg)
-                        self._finalize_current_batch_step()
-                    else:
-                        self.on_task_error(error_msg)
-                        self.set_ui_enabled(True)
-                        self.segmented_progress_bar.setVisible(False)
-                        self.progress_label.setVisible(False)
-                        self.progress_label.setText("")
+                    self.on_task_error(error_msg)
+                    self._handle_task_completion()
                     return
 
                 self.temp_audio_file = temp_audio_path
@@ -503,19 +654,20 @@ class MainWindow(QMainWindow):
 
     def _record_batch_result(self, status: str, message: str):
         """记录当前文件的批量处理结果。"""
-        if not self.batch_mode or not self.current_processing_file:
+        if not self._queue_active or not self.current_processing_file or self._current_result_recorded:
             return
 
         self.batch_results.append({
             "file": self.current_processing_file,
             "status": status,
-            "message": message
+            "message": message,
+            "output": os.path.splitext(self.current_processing_file)[0] + ".srt" if status == "success" else None,
         })
+        self._current_result_recorded = True
 
     def _finalize_current_batch_step(self):
         """在当前文件处理完成后调度下一步。"""
-        if not self.batch_mode:
-            self.reset_ui_after_task()
+        if not self._queue_active:
             return
 
         if self.batch_cancelled:
@@ -529,14 +681,19 @@ class MainWindow(QMainWindow):
 
     def _finish_batch_processing(self):
         """结束批量处理并输出总结。"""
-        if not self.batch_mode:
+        if not self._queue_active or self.thread is not None or self._pending_retry_state:
             return
+        if not self.batch_cancelled and self.current_batch_index < len(self.batch_queue) - 1:
+            QTimer.singleShot(0, self._process_next_batch_file)
+            return
+        if self.batch_cancelled and self.current_processing_file and not self._current_result_recorded:
+            self._record_batch_result("cancelled", "任务已取消")
 
-        total = len(self.batch_queue)
         success_items = [item for item in self.batch_results if item.get("status") == "success"]
         error_items = [item for item in self.batch_results if item.get("status") == "error"]
         cancelled_items = [item for item in self.batch_results if item.get("status") == "cancelled"]
-        remaining = max(0, total - (self.current_batch_index + 1))
+        total = len(self.batch_results) + max(0, len(self.batch_queue) - self.current_batch_index - 1)
+        remaining = max(0, len(self.batch_queue) - self.current_batch_index - 1)
 
         summary_parts = []
         if success_items:
@@ -551,7 +708,11 @@ class MainWindow(QMainWindow):
         summary_text = "，".join(summary_parts) if summary_parts else "无任务执行"
 
         self.log_area.append("\n" + "=" * 50)
-        self.log_area.append(f"批量处理完成（共 {total} 个文件）：{summary_text}")
+        self.log_area.append(f"队列处理{'已取消' if self.batch_cancelled else '完成'}（共 {total} 个文件）：{summary_text}")
+        if success_items:
+            self.log_area.append("输出字幕：")
+            for item in success_items:
+                self.log_area.append(f" - {item['output']}")
 
         if error_items:
             self.log_area.append("失败列表：")
@@ -566,24 +727,61 @@ class MainWindow(QMainWindow):
         if remaining:
             self.log_area.append(f"尚有 {remaining} 个文件未处理。")
 
-        title = "批量处理完成" if not self.batch_cancelled else "批量处理已取消"
-        QMessageBox.information(self, title, f"批量处理完成，共 {total} 个文件。\n{summary_text}")
+        if self.batch_mode and not self._queue_external:
+            revision = self._queue_revision
+            title = "批量处理完成" if not self.batch_cancelled else "批量处理已取消"
+            QMessageBox.information(self, title, f"批量处理完成，共 {total} 个文件。\n{summary_text}")
+            if revision != self._queue_revision:
+                QTimer.singleShot(0, self._finish_batch_processing)
+                return
 
         # 重置批量状态
+        all_success = bool(success_items) and not error_items and not cancelled_items and not self.batch_cancelled
+        self._queue_active = False
+        self._queue_external = False
+        self._queue_options = None
+        self._queue_rate_limiter = None
+        self._queued_keys.clear()
+        self._cancelling = False
         self.batch_mode = False
         self.batch_queue = []
-        self.batch_results = []
         self.batch_cancelled = False
         self.current_batch_index = -1
         self.current_processing_file = None
 
         self.reset_ui_after_task()
+        if all_success and self._can_auto_exit():
+            self._auto_exit_timer.start(500)
+
+    def _can_auto_exit(self):
+        return (self.started_from_send_to and not self._keep_open and not self._queue_active
+                and self.thread is None and not self._pending_retry_state and not self._cancelling)
+
+    def _try_auto_exit(self):
+        if not self._can_auto_exit():
+            return
+        if self._before_auto_close and not self._before_auto_close():
+            if self._can_auto_exit():
+                self._auto_exit_timer.start(100)
+            return
+        # Draining IPC can enqueue work while checking whether it is safe to close.
+        if self._can_auto_exit():
+            self.close()
+
+    def closeEvent(self, event):
+        self._auto_exit_timer.stop()
+        if self._queue_active or (self.thread is not None and self.thread.isRunning()):
+            event.ignore()
+            if not self._cancelling:
+                self.cancel_process()
+            self.log_area.append("请在线程结束后关闭窗口。")
+            return
+        super().closeEvent(event)
 
     def _execute_transcription_task(self, file_to_process, original_file, restore_state=None):
         """创建并启动后台Worker线程来执行转录任务。"""
         if self.thread and self.thread.isRunning():
-            QMessageBox.warning(self, "提示", "一个任务已经在运行中。")
-            return
+            raise RuntimeError("一个任务已经在运行中。")
 
         # 只在非重试模式下设置UI状态（重试时已在 _setup_retry_ui 中设置）
         if not restore_state:
@@ -594,25 +792,26 @@ class MainWindow(QMainWindow):
             # 重试模式下，只重置上传完成标志（UI状态已在 _setup_retry_ui 中设置）
             self.upload_complete_logged = False
 
+        options = self._queue_options or dict(self.settings)
         self.thread = QThread()
         self.worker = Worker(
             file_path=file_to_process,
-            language_code=LANGUAGES.get(self.lang_combo.currentText(), "auto"),
-            tag_audio_events=self.audio_events_checkbox.isChecked(),
+            language_code=options.get("source_language", "auto"),
+            tag_audio_events=options.get("tag_audio_events", False),
             original_file_path=original_file,
             # 移除pause_threshold参数
-            max_subtitle_duration=self.max_subtitle_duration,
-            split_duration_min=self.split_duration_min,
+            max_subtitle_duration=options["max_subtitle_duration"],
+            split_duration_min=options["split_duration_min"],
             ffmpeg_available=self.ffmpeg_available,
             restore_state=restore_state,
-            subtitle_settings=self.settings,
+            subtitle_settings=dict(options),
             # 传递异步处理设置
-            enable_async_processing=self.settings.get("enable_async_processing", True),
-            max_concurrent_chunks=self.settings.get("max_concurrent_chunks", 3),
-            max_retries=self.settings.get("max_retries", 3),
-            api_rate_limit_per_minute=self.settings.get("api_rate_limit_per_minute", 30),
-            translation_settings=self.settings,
-            translation_rate_limiter=self.translation_rate_limiter,
+            enable_async_processing=options.get("enable_async_processing", True),
+            max_concurrent_chunks=options.get("max_concurrent_chunks", 3),
+            max_retries=options.get("max_retries", 3),
+            api_rate_limit_per_minute=options.get("api_rate_limit_per_minute", 30),
+            translation_settings=dict(options),
+            translation_rate_limiter=self._queue_rate_limiter or self.translation_rate_limiter,
         )
         self.worker.moveToThread(self.thread)
 
@@ -634,16 +833,19 @@ class MainWindow(QMainWindow):
 
     def cancel_process(self):
         """请求取消当前正在运行的任务。"""
+        if not self._queue_active or self._cancelling:
+            return
         self.log_area.append("\n正在请求取消任务...")
         self._pending_retry_state = None # 取消时清除重试状态
-
-        if self.batch_mode:
-            self.batch_cancelled = True
-            self.log_area.append("批量模式：后续文件将被跳过。")
+        self._keep_open = True
+        self._cancelling = True
+        self.batch_cancelled = True
+        self._auto_exit_timer.stop()
+        self.log_area.append("后续文件将被跳过。")
 
         if self.worker:
             self.worker.request_cancellation()
-        elif self.batch_mode:
+        elif self.thread is None:
             self._finish_batch_processing()
 
     # --- 信号槽函数 ---
@@ -651,15 +853,17 @@ class MainWindow(QMainWindow):
         """任务成功完成时的处理。"""
         display_name = os.path.basename(self.current_processing_file) if self.current_processing_file else ""
 
+        self._record_batch_result("success", message)
         if self.batch_mode:
             if display_name:
                 self.log_area.append(f"\n✅ {display_name}: {message}")
             else:
                 self.log_area.append(f"\n✅ {message}")
-            self._record_batch_result("success", message)
         else:
             QMessageBox.information(self, "成功", message)
             self.log_area.append(f"\n✅ {message}")
+        if self.current_processing_file:
+            self.log_area.append(f"输出字幕：{os.path.splitext(self.current_processing_file)[0]}.srt")
 
         # 任务成功完成，清理临时文件并清除重试状态
         self._pending_retry_state = None
@@ -671,7 +875,8 @@ class MainWindow(QMainWindow):
     def on_task_error(self, message: str):
         """任务失败时的处理，提供重试选项。"""
         display_name = os.path.basename(self.current_processing_file) if self.current_processing_file else ""
-        is_cancelled = "用户取消" in message or "cancelled" in message.lower()
+        is_cancelled = self._cancelling or "用户取消" in message or "cancelled" in message.lower()
+        self._keep_open = True
 
         if self.batch_mode:
             status = "cancelled" if is_cancelled else "error"
@@ -701,12 +906,15 @@ class MainWindow(QMainWindow):
 
                 msg_box.exec()
 
-                if msg_box.clickedButton() == retry_button:
+                if msg_box.clickedButton() == retry_button and not self._queue_external and not self._cancelling:
                     # 保存状态以供重试
                     if self.worker:
                         self._pending_retry_state = self.worker.get_state()
                 else:
                     self._pending_retry_state = None
+                msg_box.deleteLater()
+            if not self._pending_retry_state:
+                self._record_batch_result("cancelled" if is_cancelled else "error", message)
 
         if self.thread:
             self.thread.quit()
@@ -758,6 +966,8 @@ class MainWindow(QMainWindow):
 
     def _handle_task_completion(self):
         """处理任务完成后的清理工作。"""
+        if self.thread is not None and self.thread.isRunning():
+            return
         # 只有在没有待重试状态时才清理临时音频文件
         if not self._pending_retry_state and self.temp_audio_file and os.path.exists(self.temp_audio_file):
             try:
@@ -767,20 +977,23 @@ class MainWindow(QMainWindow):
             except OSError as e:
                 self.log_area.append(f"清理临时文件失败: {e}")
 
+        # Release finished objects before scheduling another file or closing the window.
+        if self.thread is not None:
+            self.thread.deleteLater()
+            self.thread = None
+        self.worker = None
+
         # 如果有待重试的状态，不要重置UI，直接执行重试
         if self._pending_retry_state:
             QTimer.singleShot(1000, self._execute_retry)
         else:
-            if self.batch_mode:
-                self._finalize_current_batch_step()
-            else:
-                self.reset_ui_after_task()
-
-        # 清理线程对象
-        if self.thread and not self.thread.isRunning():
-            self.thread.deleteLater()
-            self.thread = None
-        self.worker = None
+            if self.current_processing_file:
+                if not self._current_result_recorded:
+                    self._keep_open = True
+                    self._record_batch_result("cancelled" if self.batch_cancelled else "error",
+                                              "任务已取消" if self.batch_cancelled else "后台线程未返回处理结果")
+                self._queued_keys.discard(path_key(self.current_processing_file))
+            self._finalize_current_batch_step()
 
     def _execute_retry(self):
         """执行重试逻辑。"""

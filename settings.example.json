@@ -1,4 +1,6 @@
 {
+    "source_language": "auto",
+    "tag_audio_events": false,
     "split_duration_min": 90,
     "min_subtitle_duration": 0.83,
     "max_subtitle_duration": 7.0,

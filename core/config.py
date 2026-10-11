@@ -5,7 +5,9 @@
 """
 
 # --- 文件和设置 ---
-SETTINGS_FILE = "settings.json"
+from .app_paths import application_directory
+
+SETTINGS_FILE = str(application_directory() / "settings.json")
 LANGUAGES = {"韩语": "ko", "日语": "ja", "中文": "zh", "英文": "en", "自动检测": "auto"}
 
 # --- 字幕生成规则 ---

@@ -42,10 +42,10 @@ jobs:
             echo "ASSET_NAME=Scribe2SRT-${{ github.ref_name }}-linux-x86_64.tar.gz" >> $GITHUB_ENV
           fi
 
-      - name: Run offline subtitle tests
+      - name: Run offline subtitle and SendTo tests
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m unittest discover -s tests -p "test_translation*.py" -v
+        run: python -m unittest discover -s tests -t . -p "test_*.py" -v
 
       - name: Build with PyInstaller
         shell: bash
@@ -54,6 +54,12 @@ jobs:
             --name "${{ env.EXECUTABLE_NAME }}" \
             --collect-data opencc \
             app.py
+
+      - name: Verify Windows source and packaged SendTo shortcuts
+        if: matrix.os == 'windows-latest'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tests/send_to_windows_smoke.py --executable "dist/${{ env.EXECUTABLE_NAME }}"
 
       - name: Package release (Windows)
         if: matrix.os == 'windows-latest'
