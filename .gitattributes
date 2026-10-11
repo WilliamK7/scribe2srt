@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Preserve original third-party notices byte-for-byte for their recorded hashes.
+third_party/licenses/** -text
