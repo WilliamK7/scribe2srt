@@ -7,7 +7,9 @@ SRT字幕处理器模块
 """
 
 import datetime
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
+import re
+from typing import Dict, List, Optional
 
 from .config import (
     MIN_SUBTITLE_DURATION, MIN_SUBTITLE_GAP, CPS_SETTINGS, CPL_SETTINGS
@@ -15,6 +17,20 @@ from .config import (
 from .sentence_splitter import SentenceSplitter
 from .intelligent_merger import IntelligentMerger
 from .punctuation_handler import PunctuationHandler
+
+
+@dataclass(frozen=True)
+class SubtitleEntry:
+    number: int
+    start: float
+    end: float
+    text: str
+    is_audio_event: bool = False
+    translation: Optional[str] = None
+
+
+def single_line(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def format_srt_time(seconds: float) -> str:
@@ -41,7 +57,7 @@ class SrtProcessor:
                  subtitle_settings: Dict = None):
         self.srt_content = []
         self.line_number = 1
-        self.language = json_data.get("language_code", "eng")[:3] # e.g., "eng"
+        self.language = (json_data.get("language_code") or "eng")[:3]
         self.is_cjk = self._is_cjk_language()
 
         # 如果提供了高级设置，使用它们；否则使用默认值
@@ -122,6 +138,8 @@ class SrtProcessor:
         self.audio_events = []  # 独立存储音频事件
 
         for word_info in raw_words:
+            # Splitting must never mutate the original transcription JSON.
+            word_info = word_info.copy()
             # 首先检查是否为音频事件类型
             if word_info.get('type') == 'audio_event':
                 self.audio_events.append(word_info.copy())
@@ -172,6 +190,9 @@ class SrtProcessor:
         return audio_event_entries
 
     def create_srt(self) -> str:
+        return self.render_entries(self.create_entries())
+
+    def create_entries(self) -> List[SubtitleEntry]:
         """
         Creates the full SRT content using the new two-stage approach:
         1. Sentence-level pre-splitting based on punctuation priority (only for word types)
@@ -180,7 +201,7 @@ class SrtProcessor:
         4. Final integration and sorting
         """
         if not self.words and not self.audio_events:
-            return ""
+            return []
 
         # Stage 1: Sentence-level pre-splitting (only for word types)
         basic_entries = []
@@ -214,8 +235,27 @@ class SrtProcessor:
         all_entries = merged_entries + audio_event_entries
         all_entries.sort(key=lambda x: x['start'])  # 按时间顺序排序
 
-        # Stage 5: Generate final SRT content with optimized display formatting
-        return self._generate_final_srt_content(all_entries)
+        return [SubtitleEntry(i, entry['start'], entry['end'], entry['text'],
+                              entry.get('is_audio_event', False))
+                for i, entry in enumerate(all_entries, 1)]
+
+    def render_entries(self, entries: List[SubtitleEntry]) -> str:
+        """Render translations as exactly two lines, preserving entry structure."""
+        srt_lines = []
+        for entry in entries:
+            if entry.translation is None:
+                text = self._optimize_text_display(entry.text)
+            else:
+                original = single_line(entry.text)
+                translated = single_line(entry.translation)
+                if not original or not translated:
+                    raise ValueError(f"字幕 {entry.number} 的原文或译文为空。")
+                text = f"{original}\n{translated}"
+            srt_lines.append(
+                f"{entry.number}\n{format_srt_time(entry.start)} --> "
+                f"{format_srt_time(entry.end)}\n{text}\n"
+            )
+        return "\n".join(srt_lines)
 
     def _generate_final_srt_content(self, entries: List[Dict]) -> str:
         """
@@ -227,24 +267,11 @@ class SrtProcessor:
         Returns:
             Final SRT content string
         """
-        if not entries:
-            return ""
-        
-        srt_lines = []
-        
-        for i, entry in enumerate(entries, 1):
-            # Format timing
-            start_time_str = format_srt_time(entry['start'])
-            end_time_str = format_srt_time(entry['end'])
-            
-            # Optimize text display format
-            formatted_text = self._optimize_text_display(entry['text'])
-            
-            # Generate SRT entry
-            srt_entry = f"{i}\n{start_time_str} --> {end_time_str}\n{formatted_text}\n"
-            srt_lines.append(srt_entry)
-        
-        return "\n".join(srt_lines)
+        return self.render_entries([
+            SubtitleEntry(i, entry['start'], entry['end'], entry['text'],
+                          entry.get('is_audio_event', False))
+            for i, entry in enumerate(entries, 1)
+        ])
     
     def _optimize_text_display(self, text: str) -> str:
         """

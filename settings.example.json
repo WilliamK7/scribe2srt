@@ -1,0 +1,22 @@
+{
+    "split_duration_min": 90,
+    "min_subtitle_duration": 0.83,
+    "max_subtitle_duration": 7.0,
+    "min_subtitle_gap": 0.083,
+    "cjk_cps": 11,
+    "latin_cps": 15,
+    "cjk_chars_per_line": 25,
+    "latin_chars_per_line": 42,
+    "enable_async_processing": true,
+    "max_concurrent_chunks": 3,
+    "max_retries": 3,
+    "api_rate_limit_per_minute": 30,
+    "translation_enabled": true,
+    "translation_api_key": "",
+    "translation_region": "cn-beijing",
+    "translation_workspace_id": "",
+    "translation_model": "qwen-mt-flash",
+    "translation_batch_size": 10,
+    "translation_max_concurrent": 3,
+    "translation_rate_limit_per_minute": 60
+}

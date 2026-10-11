@@ -46,6 +46,25 @@ DEFAULT_SUBTITLE_SETTINGS = {
 # 其他设置
 DEFAULT_SPLIT_DURATION_MIN = 90  # 长文件自动切分的默认阈值（分钟）
 
+# 翻译配置与转录限流相互独立；密钥只在远程翻译时检查。
+DEFAULT_TRANSLATION_SETTINGS = {
+    "translation_enabled": True,
+    "translation_api_key": "",
+    "translation_region": "cn-beijing",
+    "translation_workspace_id": "",
+    "translation_model": "qwen-mt-flash",
+    "translation_batch_size": 10,
+    "translation_max_concurrent": 3,
+    "translation_rate_limit_per_minute": 60,
+}
+TRANSLATION_MAX_CHARACTERS = 2000
+TRANSLATION_MODELS = ("qwen-mt-flash", "qwen-mt-plus", "qwen-mt-lite")
+TRANSLATION_REGIONS = {
+    "北京": "cn-beijing",
+    "新加坡": "ap-southeast-1",
+    "中国香港": "cn-hongkong",
+}
+
 # --- UI 样式表 ---
 STYLESHEET = """
 QWidget {

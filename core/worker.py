@@ -13,7 +13,10 @@ from typing import Optional, List, Dict, Any
 from PySide6.QtCore import QObject, Signal, QThreadPool
 
 from api.client import ElevenLabsSTTClient
-from .srt_processor import create_srt_from_json
+from .subtitle_pipeline import process_subtitles
+from .atomic_io import atomic_write_text
+from .cancellation import CancellationToken
+from .translation import translation_cache_path
 from .async_chunk_processor import AsyncChunkProcessor
 
 class Worker(QObject):
@@ -26,13 +29,15 @@ class Worker(QObject):
     progress_updated = Signal(int, int)
     chunk_progress = Signal(int, str, str)  # chunk_index, status, message
     chunks_ready = Signal(list)  # chunk_paths - 通知UI设置分段进度条
+    subtitle_progress = Signal(int, int)  # completed entries, total entries
 
     def __init__(self, file_path: str, language_code: str, tag_audio_events: bool,
                  max_subtitle_duration: float, split_duration_min: int,
                  original_file_path: Optional[str] = None, ffmpeg_available: bool = False,
                  restore_state: Optional[Dict[str, Any]] = None, subtitle_settings: Optional[Dict] = None,
                  enable_async_processing: bool = True, max_concurrent_chunks: int = 3,
-                 max_retries: int = 3, api_rate_limit_per_minute: int = 30):
+                 max_retries: int = 3, api_rate_limit_per_minute: int = 30,
+                 translation_settings: Optional[Dict] = None, translation_rate_limiter=None):
         super().__init__()
         self.file_path = file_path
         self.original_file_path = original_file_path if original_file_path else file_path
@@ -43,6 +48,13 @@ class Worker(QObject):
         self.ffmpeg_available = ffmpeg_available
         self.restore_state = restore_state
         self.subtitle_settings = subtitle_settings
+        self.translation_settings = dict(translation_settings or subtitle_settings or {})
+        self.translation_rate_limiter = translation_rate_limiter
+        self.cancellation = CancellationToken()
+        self.stage = (restore_state or {}).get("stage", "transcription")
+        self.transcript_ready = (restore_state or {}).get("transcript_ready", False)
+        self.is_json_input = os.path.splitext(self.original_file_path)[1].lower() == ".json"
+        self._terminal = False
         
         self.uploader = None
         self.client = ElevenLabsSTTClient(signals_forwarder=self, ffmpeg_available=self.ffmpeg_available)
@@ -113,9 +125,39 @@ class Worker(QObject):
             # 添加处理模式信息，用于正确的重试逻辑
             "was_single_file_mode": self.total_chunks == 1,
             "extracted_audio_file": getattr(self, 'extracted_audio_file', None),
+            "stage": self.stage,
+            "transcript_ready": self.transcript_ready,
         }
 
     def run(self):
+        try:
+            self.cancellation.check()
+            if self.is_json_input:
+                with open(self.original_file_path, encoding="utf-8-sig") as handle:
+                    self.combined_transcript = json.load(handle)
+                self.transcript_ready = True
+                self._finalize_task()
+                return
+            if self.transcript_ready:
+                self.log_message.emit("复用已完成的转录，恢复字幕处理阶段...")
+                self._finalize_task()
+                return
+            # A remaining translation checkpoint signals an unfinished subtitle stage.
+            transcript_path = os.path.splitext(self.original_file_path)[0] + ".json"
+            if (os.path.exists(translation_cache_path(self.original_file_path))
+                    and os.path.exists(transcript_path)
+                    and os.path.getmtime(transcript_path) >= os.path.getmtime(self.original_file_path)):
+                with open(transcript_path, encoding="utf-8") as handle:
+                    self.combined_transcript = json.load(handle)
+                self.transcript_ready = True
+                self.log_message.emit("检测到翻译进度，复用已保存的转录 JSON。")
+                self._finalize_task()
+                return
+            self._run_transcription()
+        except Exception as exc:
+            self._fail(f"处理文件失败: {exc}")
+
+    def _run_transcription(self):
         """任务执行的入口点。"""
         is_restoring = self.restore_state and self.restore_state.get("temp_chunks")
 
@@ -150,7 +192,7 @@ class Worker(QObject):
                         temp_audio_path = os.path.join(os.path.dirname(original_file), f"temp_audio_{base_name}{extension}")
 
                         if not extract_audio(original_file, temp_audio_path):
-                            self.error.emit("恢复任务失败：无法重新提取音频。")
+                            self._fail("恢复任务失败：无法重新提取音频。")
                             return
 
                         # 更新文件路径
@@ -166,7 +208,7 @@ class Worker(QObject):
                     # 多片段模式：重新切分音频
                     self.log_message.emit("检测到临时切片文件丢失，正在重新切分...")
                     if not self._split_audio(self.restore_state.get("original_file_path", self.original_file_path)):
-                         self.error.emit("恢复任务失败：无法重新切分音频。")
+                         self._fail("恢复任务失败：无法重新切分音频。")
                          return
 
             # 恢复模式下的处理逻辑
@@ -240,14 +282,13 @@ class Worker(QObject):
             error_message = f"音频切分失败: {e}"
             if hasattr(e, 'stderr'):
                 error_message += f"\nFFmpeg 输出:\n{e.stderr.strip()}"
-            self.error.emit(error_message)
+            self._fail(error_message)
             return False
 
     def _process_next_chunk(self):
         """处理下一个待处理的音频片段。"""
         if self._is_cancelled:
-            self.error.emit("任务被用户取消。")
-            self._cleanup_chunks(force_cleanup=True)  # 用户取消时强制清理
+            self._fail("任务被用户取消。")
             return
 
         # 检查是否使用异步处理
@@ -290,7 +331,7 @@ class Worker(QObject):
         )
 
         if not success:
-            self.error.emit("启动异步处理失败")
+            self._fail("启动异步处理失败")
 
     def _process_chunks_sequential(self):
         """顺序处理音频片段（原有逻辑）"""
@@ -360,7 +401,7 @@ class Worker(QObject):
         )
 
         if not success:
-            self.error.emit("恢复模式：启动异步处理失败")
+            self._fail("恢复模式：启动异步处理失败")
 
     def _process_single_file(self, file_path: str):
         """为单个文件准备并开始上传任务。"""
@@ -368,7 +409,7 @@ class Worker(QObject):
             file_path, self.language_code, self.tag_audio_events
         )
         if not self.uploader:
-            self.error.emit(f"为文件 {os.path.basename(file_path)} 准备任务失败。")
+            self._fail(f"为文件 {os.path.basename(file_path)} 准备任务失败。")
             return
 
         self.uploader.signals.progress.connect(self.progress_updated)
@@ -395,8 +436,11 @@ class Worker(QObject):
 
     def _on_async_all_completed(self, combined_transcript: dict):
         """所有异步片段完成回调"""
+        if self._is_cancelled or self._terminal:
+            return
         self.log_message.emit("所有片段异步处理完成，正在合并结果...")
         self.combined_transcript = combined_transcript
+        self.current_chunk_index = self.total_chunks
 
         # 确保进度显示完成
         self.chunk_progress.emit(-1, "completed", "异步处理完成，正在生成字幕文件...")
@@ -407,6 +451,9 @@ class Worker(QObject):
     def _on_async_processing_failed(self, error_message: str):
         """异步处理失败回调"""
         self.log_message.emit(f"异步处理失败: {error_message}")
+        if self._is_cancelled:
+            self._fail("任务被用户取消。")
+            return
 
         # 检查是否可以降级到顺序处理
         if self.async_processor:
@@ -419,9 +466,9 @@ class Worker(QObject):
                 self._fallback_to_sequential_processing()
             else:
                 # 完全失败，报告错误
-                self.error.emit(f"异步处理完全失败: {error_message}")
+                self._fail(f"异步处理完全失败: {error_message}")
         else:
-            self.error.emit(f"异步处理失败: {error_message}")
+            self._fail(f"异步处理失败: {error_message}")
 
     def _fallback_to_sequential_processing(self):
         """降级到顺序处理模式"""
@@ -469,7 +516,7 @@ class Worker(QObject):
                 self._finalize_task()
 
         except Exception as e:
-            self.error.emit(f"降级处理失败: {e}")
+            self._fail(f"降级处理失败: {e}")
 
     def _on_async_progress_updated(self, chunk_index: int, bytes_sent: int, total_bytes: int):
         """异步处理进度更新回调"""
@@ -497,6 +544,8 @@ class Worker(QObject):
 
     def _on_async_all_completed_restored(self, remaining_transcript: dict):
         """恢复模式：所有剩余异步片段完成回调"""
+        if self._is_cancelled or self._terminal:
+            return
         self.log_message.emit("恢复模式：所有剩余片段异步处理完成，正在合并结果...")
 
         # 合并已有的转录结果和新的转录结果
@@ -521,6 +570,8 @@ class Worker(QObject):
 
     def on_upload_finished(self, transcript_json):
         """当一个片段上传和转录成功时调用。"""
+        if self._is_cancelled or self._terminal:
+            return
         self.log_message.emit(f"片段 {self.current_chunk_index + 1}/{self.total_chunks} 转录成功。")
         
         # 保存分段的 JSON 文件以供调试
@@ -554,57 +605,48 @@ class Worker(QObject):
 
     def on_chunk_error(self, error_message: str):
         """当处理片段出错时调用。"""
-        self.error.emit(f"处理片段 {self.current_chunk_index + 1}/{self.total_chunks} 时出错: {error_message}")
+        self._fail(f"处理片段 {self.current_chunk_index + 1}/{self.total_chunks} 时出错: {error_message}")
 
     def _finalize_task(self):
-        """所有片段处理完毕后，合并结果并生成最终文件。"""
-        self.log_message.emit("-" * 20)
-        self.log_message.emit("所有片段处理完毕，正在生成最终文件...")
-        
-        base_path, _ = os.path.splitext(self.original_file_path)
-        output_json_path = base_path + ".json"
-        try:
-            with open(output_json_path, 'w', encoding='utf-8') as f:
-                json.dump(self.combined_transcript, f, ensure_ascii=False, indent=4)
-            self.log_message.emit(f"合并后的转录文本已保存到:\n{output_json_path}")
-        except Exception as e:
-            self.error.emit(f"保存合并后的 JSON 文件时出错: {e}")
-            # 保存失败时不清理临时文件，以便重试
+        """Persist raw transcription before the common cancellable subtitle stage."""
+        if self._terminal:
             return
-
-        self.log_message.emit("正在生成SRT字幕文件...")
-        srt_data = create_srt_from_json(
-            self.combined_transcript,
-            max_subtitle_duration=self.max_subtitle_duration,
-            subtitle_settings=self.subtitle_settings
-        )
-        if not srt_data:
-            self.error.emit("从合并后的JSON生成SRT失败。")
-            # SRT生成失败时不清理临时文件，以便重试
-            return
-
-        output_srt_path = base_path + ".srt"
-        task_success = False
+        self.transcript_ready = True
+        self.stage = "subtitles"
         try:
-            with open(output_srt_path, 'w', encoding='utf-8') as f:
-                f.write(srt_data)
-            self.log_message.emit(f"最终SRT字幕文件已保存到:\n{output_srt_path}")
-
-            # 在单文件处理模式下，清理冗余的临时JSON文件
-            self._cleanup_temporary_json_files()
-
-            task_success = True
-            self.finished.emit("任务成功完成！")
-        except Exception as e:
-            self.error.emit(f"保存最终SRT文件时出错: {e}")
-            # 保存失败时不清理临时文件，以便重试
-        finally:
-            # 只有在任务成功完成时才清理临时文件
-            if task_success:
+            self.cancellation.check()
+            if not self.is_json_input:
+                output_json_path = os.path.splitext(self.original_file_path)[0] + ".json"
+                atomic_write_text(output_json_path, json.dumps(self.combined_transcript,
+                                  ensure_ascii=False, indent=4), self.cancellation)
+                self.log_message.emit(f"原始转录 JSON 已保存到:\n{output_json_path}")
+            process_subtitles(
+                self.combined_transcript, self.original_file_path,
+                settings={**(self.subtitle_settings or {}), **self.translation_settings},
+                selected_language=self.language_code,
+                max_subtitle_duration=self.max_subtitle_duration,
+                cancellation=self.cancellation,
+                progress=lambda done, total: self.subtitle_progress.emit(done, total),
+                log=lambda message: self.log_message.emit(message),
+                rate_limiter=self.translation_rate_limiter,
+            )
+            if not self.is_json_input:
+                self._cleanup_temporary_json_files()
                 self._cleanup_chunks(force_cleanup=True)
+            self._terminal = True
+            self.finished.emit("任务成功完成！")
+        except Exception as exc:
+            self._fail(f"字幕处理失败: {exc}")
+
+    def _fail(self, message):
+        if not self._terminal:
+            self._terminal = True
+            self.error.emit(message)
 
     def _cleanup_temporary_json_files(self):
         """清理单文件处理模式下的冗余临时JSON文件"""
+        if self.is_json_input:
+            return
         if self.total_chunks == 1:
             # 单文件处理模式：检查是否需要清理临时JSON文件
             try:
@@ -632,8 +674,13 @@ class Worker(QObject):
 
     def request_cancellation(self):
         """请求取消当前任务。"""
-        self.log_message.emit("正在取消上传...")
+        if self._terminal:
+            return
+        self.log_message.emit("正在取消任务，保留已完成的翻译进度...")
         self._is_cancelled = True
+        self.cancellation.cancel()
+        if self.stage == "subtitles":
+            return  # The subtitle coordinator reports cancellation from the worker thread.
 
         # 取消异步处理器
         if self.async_processor:
@@ -643,8 +690,7 @@ class Worker(QObject):
         if self.uploader:
             self.uploader.cancel()
 
-        # 用户取消时强制清理临时文件
-        self._cleanup_chunks(force_cleanup=True)
+        self._fail("任务被用户取消。")
 
     def _cleanup_chunks(self, force_cleanup=False):
         """清理所有临时的音频片段文件。
@@ -652,6 +698,8 @@ class Worker(QObject):
         Args:
             force_cleanup: 强制清理，即使任务可能需要重试
         """
+        if self.is_json_input:
+            return
         # 如果不是强制清理且任务可能需要重试，则跳过清理
         if not force_cleanup and not self._is_cancelled:
             self.log_message.emit("任务可能需要重试，保留临时文件...")

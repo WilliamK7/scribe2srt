@@ -20,14 +20,17 @@ from PySide6.QtGui import QIcon
 # --- 从重构后的模块中导入 ---
 from core.config import (
     LANGUAGES, SETTINGS_FILE, MAX_SUBTITLE_DURATION,
-    DEFAULT_SPLIT_DURATION_MIN, DEFAULT_SUBTITLE_SETTINGS
+    DEFAULT_SPLIT_DURATION_MIN, DEFAULT_SUBTITLE_SETTINGS, DEFAULT_TRANSLATION_SETTINGS
 )
 from core.worker import Worker
 from core.ffmpeg_utils import is_ffmpeg_available, extract_audio, get_media_info
-from core.srt_processor import create_srt_from_json
+from api.translation_client import RequestRateLimiter
+from core.atomic_io import atomic_write_text
+from core.translation import translation_cache_path
 from .widgets import CustomCheckBox
 from .settings_dialog import SettingsDialog
 from .async_settings_dialog import AsyncSettingsDialog
+from .translation_settings_dialog import TranslationSettingsDialog
 from .segmented_progress_bar import SegmentedProgressBar
 
 
@@ -73,6 +76,9 @@ class MainWindow(QMainWindow):
         self._pending_retry_state: Optional[Dict[str, Any]] = None
         
         self.load_settings()
+        self.translation_rate_limiter = RequestRateLimiter(
+            self.settings["translation_rate_limit_per_minute"],
+            max_concurrent=self.settings["translation_max_concurrent"])
         self.setup_ui()
         
         self.ffmpeg_available = self._check_ffmpeg()
@@ -120,6 +126,15 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.async_settings_button)
         options_layout.addWidget(self.settings_button)
         main_layout.addLayout(options_layout)
+
+        translation_layout = QHBoxLayout()
+        self.translation_checkbox = CustomCheckBox("自动翻译为简体中文")
+        self.translation_checkbox.setChecked(self.settings["translation_enabled"])
+        self.translation_settings_button = QPushButton("翻译设置")
+        translation_layout.addWidget(self.translation_checkbox)
+        translation_layout.addStretch(1)
+        translation_layout.addWidget(self.translation_settings_button)
+        main_layout.addLayout(translation_layout)
         
         # --- 进度条和标签 ---
         self.progress_label = QLabel("")
@@ -132,6 +147,9 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(self.progress_label)
         main_layout.addWidget(self.segmented_progress_bar)
+        self.subtitle_progress_bar = QProgressBar()
+        self.subtitle_progress_bar.setVisible(False)
+        main_layout.addWidget(self.subtitle_progress_bar)
         
         # --- 操作按钮 ---
         action_layout = QHBoxLayout()
@@ -161,6 +179,8 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self.cancel_process)
         self.async_settings_button.clicked.connect(self.open_async_settings_dialog)
         self.settings_button.clicked.connect(self.open_settings_dialog)
+        self.translation_settings_button.clicked.connect(self.open_translation_settings_dialog)
+        self.translation_checkbox.toggled.connect(self._translation_toggled)
 
     def _apply_dark_mode_title_bar(self):
         """(仅Windows) 尝试设置窗口标题栏为暗色模式。"""
@@ -192,6 +212,7 @@ class MainWindow(QMainWindow):
         """从文件加载设置，如果文件不存在则使用默认值。"""
         # 使用新的默认设置结构（移除pause_threshold）
         self.settings = {
+            **DEFAULT_TRANSLATION_SETTINGS,
             # 基础设置
             "split_duration_min": DEFAULT_SPLIT_DURATION_MIN,
 
@@ -229,8 +250,21 @@ class MainWindow(QMainWindow):
 
     def save_settings(self):
         """保存当前设置到文件。"""
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.settings, f, indent=4)
+        atomic_write_text(SETTINGS_FILE, json.dumps(self.settings, ensure_ascii=False, indent=4))
+
+    def _translation_toggled(self, enabled):
+        self.settings["translation_enabled"] = enabled
+        self.save_settings()
+
+    def open_translation_settings_dialog(self):
+        dialog = TranslationSettingsDialog(self.settings, self)
+        if dialog.exec():
+            self.settings.update(dialog.get_settings())
+            self.save_settings()
+            self.translation_rate_limiter = RequestRateLimiter(
+                self.settings["translation_rate_limit_per_minute"],
+                max_concurrent=self.settings["translation_max_concurrent"])
+            self.log_area.append("翻译设置已更新。")
 
     def open_settings_dialog(self):
         """打开设置对话框并处理结果。"""
@@ -310,12 +344,15 @@ class MainWindow(QMainWindow):
         self.audio_events_checkbox.setEnabled(enabled)
         self.async_settings_button.setEnabled(enabled)
         self.settings_button.setEnabled(enabled)
+        self.translation_checkbox.setEnabled(enabled)
+        self.translation_settings_button.setEnabled(enabled)
         self.setAcceptDrops(enabled)
 
     def reset_ui_after_task(self):
         """任务完成后重置UI到初始状态。"""
         self.set_ui_enabled(True)
         self.segmented_progress_bar.setVisible(False)
+        self.subtitle_progress_bar.setVisible(False)
         self.progress_label.setVisible(False)
         self.set_files([])
 
@@ -344,6 +381,9 @@ class MainWindow(QMainWindow):
 
     def _process_next_batch_file(self):
         """处理待处理队列中的下一个文件。"""
+        if self.batch_cancelled:
+            self._finish_batch_processing()
+            return
         self.current_batch_index += 1
 
         if self.current_batch_index >= len(self.batch_queue):
@@ -372,6 +412,7 @@ class MainWindow(QMainWindow):
 
         # 重置进度显示
         self.segmented_progress_bar.reset()
+        self.subtitle_progress_bar.setVisible(False)
         self.segmented_progress_bar.setVisible(False)
         self.progress_label.setVisible(False)
         self.progress_label.setText("")
@@ -390,6 +431,12 @@ class MainWindow(QMainWindow):
         self.segmented_progress_bar.set_single_file_mode(source_file)
         self.progress_label.setText("准备中...")
         self.progress_label.setVisible(True)
+
+        transcript_path = os.path.splitext(source_file)[0] + ".json"
+        if (os.path.exists(translation_cache_path(source_file)) and os.path.exists(transcript_path)
+                and os.path.getmtime(transcript_path) >= os.path.getmtime(source_file)):
+            self._execute_transcription_task(source_file, source_file)
+            return
 
         file_to_process = source_file
         _, ext = os.path.splitext(source_file)
@@ -448,50 +495,11 @@ class MainWindow(QMainWindow):
         self._execute_transcription_task(file_to_process, source_file)
 
     def _process_json_file_directly(self, json_path: str, from_batch: bool = False):
-        """直接从JSON文件生成SRT，不进行API调用。"""
-        self.set_ui_enabled(False)
-        if not from_batch:
-            self.log_area.clear()
-        self.log_area.append("=" * 50)
-        self.log_area.append("检测到JSON文件，直接生成SRT...")
-
-        success = False
-        message = ""
-
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                json_data = json.load(f)
-
-            srt_data = create_srt_from_json(
-                json_data,
-                max_subtitle_duration=self.max_subtitle_duration,
-                subtitle_settings=self.settings
-            )
-            if not srt_data and not json_data.get("words"):
-                raise ValueError("JSON文件可能为空或不包含'words'数据。")
-
-            output_srt_path = os.path.splitext(json_path)[0] + ".srt"
-            with open(output_srt_path, 'w', encoding='utf-8') as f:
-                f.write(srt_data)
-
-            message = f"SRT字幕文件已保存到:\n{output_srt_path}"
-            self.log_area.append(message)
-            if not from_batch:
-                QMessageBox.information(self, "成功", "JSON文件处理成功！")
-            success = True
-        except Exception as e:
-            message = f"处理JSON文件时出错: {e}"
-            if from_batch:
-                self.log_area.append(f"\n❌ {message}")
-            else:
-                self.on_task_error(message)
-        finally:
-            if from_batch:
-                status = "success" if success else "error"
-                self._record_batch_result(status, message)
-                self._finalize_current_batch_step()
-            else:
-                self.reset_ui_after_task()
+        """Import JSON in the same background worker, skipping transcription."""
+        self.log_area.append("检测到 JSON 文件，开始后台字幕处理...")
+        self.progress_label.setText("正在处理字幕...")
+        self.progress_label.setVisible(True)
+        self._execute_transcription_task(json_path, json_path)
 
     def _record_batch_result(self, status: str, message: str):
         """记录当前文件的批量处理结果。"""
@@ -581,7 +589,7 @@ class MainWindow(QMainWindow):
         if not restore_state:
             self.upload_complete_logged = False
             self.set_ui_enabled(False)
-            self.log_area.append("开始执行转录任务...")
+            self.log_area.append("开始执行后台处理任务...")
         else:
             # 重试模式下，只重置上传完成标志（UI状态已在 _setup_retry_ui 中设置）
             self.upload_complete_logged = False
@@ -602,7 +610,9 @@ class MainWindow(QMainWindow):
             enable_async_processing=self.settings.get("enable_async_processing", True),
             max_concurrent_chunks=self.settings.get("max_concurrent_chunks", 3),
             max_retries=self.settings.get("max_retries", 3),
-            api_rate_limit_per_minute=self.settings.get("api_rate_limit_per_minute", 30)
+            api_rate_limit_per_minute=self.settings.get("api_rate_limit_per_minute", 30),
+            translation_settings=self.settings,
+            translation_rate_limiter=self.translation_rate_limiter,
         )
         self.worker.moveToThread(self.thread)
 
@@ -613,6 +623,8 @@ class MainWindow(QMainWindow):
         self.worker.progress_updated.connect(self.update_progress)
         self.worker.chunk_progress.connect(self.update_chunk_progress)
         self.worker.chunks_ready.connect(self.on_chunks_ready)
+        self.worker.subtitle_progress.connect(self.update_subtitle_progress)
+        self.thread.finished.connect(self.worker.deleteLater)
 
         # 线程结束后，统一由 _handle_task_completion 处理
         self.thread.finished.connect(self._handle_task_completion)
@@ -629,11 +641,10 @@ class MainWindow(QMainWindow):
             self.batch_cancelled = True
             self.log_area.append("批量模式：后续文件将被跳过。")
 
-        # 取消时清理临时文件
-        self._cleanup_temp_audio_file()
-
         if self.worker:
             self.worker.request_cancellation()
+        elif self.batch_mode:
+            self._finish_batch_processing()
 
     # --- 信号槽函数 ---
     def on_task_finished(self, message: str):
@@ -725,6 +736,15 @@ class MainWindow(QMainWindow):
                 self.progress_label.setText("正在上传...")
             # 如果已经完成上传，保持"上传完成，正在处理..."状态
 
+    def update_subtitle_progress(self, completed, total):
+        self.segmented_progress_bar.setVisible(False)
+        self.subtitle_progress_bar.setVisible(True)
+        self.subtitle_progress_bar.setRange(0, total)
+        self.subtitle_progress_bar.setValue(completed)
+        self.subtitle_progress_bar.setFormat(f"{completed} / {total}")
+        self.progress_label.setVisible(True)
+        self.progress_label.setText(f"字幕处理：已完成 {completed} / {total} 条")
+
     def update_chunk_progress(self, chunk_index, status, message):
         """更新片段处理进度。"""
         self.segmented_progress_bar.update_chunk_status(chunk_index, status)
@@ -801,6 +821,10 @@ class MainWindow(QMainWindow):
         self.segmented_progress_bar.setVisible(True)
         self.progress_label.setVisible(True)
         self.progress_label.setText("重试中...")
+        self.subtitle_progress_bar.setVisible(False)
+        if restore_state.get("transcript_ready"):
+            self.segmented_progress_bar.setVisible(False)
+            return
 
         # 重置上传完成标志
         self.upload_complete_logged = False

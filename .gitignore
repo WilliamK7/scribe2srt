@@ -124,3 +124,7 @@ dmypy.json
 # IDE-specific files
 .vscode/
 .idea/
+
+# Local credentials and resumable subtitle translations
+/settings.json
+*.translation-cache.json
