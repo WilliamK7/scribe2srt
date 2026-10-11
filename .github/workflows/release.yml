@@ -37,7 +37,7 @@ jobs:
       - name: Install pinned build dependencies
         run: |
           $ErrorActionPreference = 'Stop'
-          python -m pip install -r requirements-build.txt
+          python -m pip install --disable-pip-version-check --no-input --progress-bar off -r requirements-build.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

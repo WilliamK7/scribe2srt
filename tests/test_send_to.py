@@ -511,12 +511,12 @@ class ShortcutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, patch.object(sys, "frozen", True, create=True), \
                 patch.object(sys, "executable", str(Path(temporary, "程序 空格.exe"))):
             spec = integration.shortcut_spec()
-        self.assertEqual(spec.target, str(Path(temporary, "程序 空格.exe")))
+        self.assertEqual(spec.target, str(Path(temporary, "程序 空格.exe").resolve()))
         self.assertEqual(spec.arguments, "--send-to --")
-        self.assertEqual(spec.working_directory, temporary)
+        self.assertEqual(spec.working_directory, str(Path(temporary).resolve()))
 
     def test_real_com_shortcut_add_update_remove_preserve_other_files_and_quote_paths(self):
-        with tempfile.TemporaryDirectory(prefix="scribe2srt-中文 空格 '$` ") as temporary:
+        with tempfile.TemporaryDirectory(prefix="scribe2srt-中文 😀 空格 '$` ") as temporary:
             other = Path(temporary, "Other.lnk")
             other.write_bytes(b"preserve other shortcuts")
             spec = integration.ShortcutSpec(str(Path(sys.executable).with_name("pythonw.exe")),
@@ -526,11 +526,7 @@ class ShortcutTests(unittest.TestCase):
                 self.assertEqual(Path(path), Path(temporary, integration.SHORTCUT_NAME))
                 path_again = integration.add_send_to_shortcut(temporary)
                 self.assertEqual(path_again, path)
-            fields = integration._run_powershell(
-                "$shell = New-Object -ComObject WScript.Shell\n"
-                f"$shortcut = $shell.CreateShortcut({integration._ps_string(path)})\n"
-                "[PSCustomObject]@{target=$shortcut.TargetPath; arguments=$shortcut.Arguments; directory=$shortcut.WorkingDirectory} | ConvertTo-Json -Compress\n")
-            fields = json.loads(fields)
+            fields = integration._read_shortcut(path)
             self.assertEqual(os.path.normcase(fields["target"]), os.path.normcase(spec.target))
             self.assertEqual(fields["arguments"], spec.arguments)
             self.assertEqual(os.path.normcase(fields["directory"]), os.path.normcase(spec.working_directory))

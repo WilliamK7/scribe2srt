@@ -12,7 +12,7 @@ try {
     }
     & $Python -c "import struct,sys; assert sys.platform == 'win32' and sys.version_info[:2] == (3,11) and struct.calcsize('P') == 8, 'Use Windows x64 Python 3.11'"
     if ($LASTEXITCODE -ne 0) { throw 'Unsupported Python environment' }
-    & $Python -m pip install -r requirements-build.txt
+    & $Python -m pip install --disable-pip-version-check --no-input --progress-bar off -r requirements-build.txt
     if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
     & $Python -m pip check
     if ($LASTEXITCODE -ne 0) { throw 'Dependency consistency check failed' }

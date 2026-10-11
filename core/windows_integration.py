@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .app_paths import application_directory
+from .windows_shortcut import ShellLink, read_shortcut as _read_shortcut
 
 
 SHORTCUT_NAME = "Scribe2SRT.lnk"
@@ -64,39 +65,45 @@ def _run_powershell(script: str) -> str:
     return result.stdout.strip()
 
 
-def _shortcut_script(directory=None) -> str:
-    location = (_ps_string(os.path.abspath(directory)) if directory is not None else
-                "[Environment]::GetFolderPath([Environment+SpecialFolder]::SendTo)")
-    return (f"$directory = {location}\n"
-            "if (-not $directory) { throw '无法找到当前用户的 SendTo 目录。' }\n"
-            f"$path = Join-Path $directory {_ps_string(SHORTCUT_NAME)}\n"
-            "$shell = New-Object -ComObject WScript.Shell\n"
-            "if (Test-Path -LiteralPath $path) {\n"
-            "    $existing = $shell.CreateShortcut($path)\n"
-            f"    if ($existing.Description -ne {_ps_string(SHORTCUT_DESCRIPTION)}) {{\n"
-            "        throw '同名快捷方式不属于本程序，请先检查 Scribe2SRT.lnk。'\n"
-            "    }\n"
-            "}\n")
+def _shortcut_path(directory=None) -> Path:
+    if sys.platform != "win32":
+        raise IntegrationError("“发送到”集成仅支持 Windows。")
+    if directory is None:
+        directory = _run_powershell(
+            "[Console]::WriteLine([Environment]::GetFolderPath([Environment+SpecialFolder]::SendTo))\n")
+        if not directory:
+            raise IntegrationError("无法找到当前用户的 SendTo 目录。")
+    return Path(os.path.abspath(directory)) / SHORTCUT_NAME
+
+
+def _check_owner(path):
+    if path.exists() and _read_shortcut(path)["description"] != SHORTCUT_DESCRIPTION:
+        raise IntegrationError("同名快捷方式不属于本程序，请先检查 Scribe2SRT.lnk。")
 
 
 def add_send_to_shortcut(directory=None) -> str:
     spec = shortcut_spec()
-    script = _shortcut_script(directory)
-    script += ("[IO.Directory]::CreateDirectory($directory) | Out-Null\n"
-               "$shortcut = $shell.CreateShortcut($path)\n"
-               f"$shortcut.TargetPath = {_ps_string(spec.target)}\n"
-               f"$shortcut.Arguments = {_ps_string(spec.arguments)}\n"
-               f"$shortcut.WorkingDirectory = {_ps_string(spec.working_directory)}\n"
-               f"$shortcut.Description = {_ps_string(SHORTCUT_DESCRIPTION)}\n"
-               f"$shortcut.IconLocation = {_ps_string(spec.target + ',0')}\n"
-               "$shortcut.WindowStyle = 1\n"
-               "$shortcut.Save()\n"
-               "if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw '快捷方式保存失败。' }\n"
-               "[Console]::WriteLine($path)\n")
-    return _run_powershell(script)
+    path = _shortcut_path(directory)
+    try:
+        _check_owner(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with ShellLink() as link:
+            if path.exists():
+                link.load(path)
+            link.configure(spec, SHORTCUT_DESCRIPTION)
+            link.save(path)
+        if not path.is_file():
+            raise OSError("快捷方式保存失败。")
+    except OSError as exc:
+        raise IntegrationError(f"无法更新“发送到”快捷方式：{exc}") from exc
+    return str(path)
 
 
 def remove_send_to_shortcut(directory=None) -> str:
-    return _run_powershell(_shortcut_script(directory) +
-                           "if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }\n"
-                           "[Console]::WriteLine($path)\n")
+    path = _shortcut_path(directory)
+    try:
+        _check_owner(path)
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise IntegrationError(f"无法更新“发送到”快捷方式：{exc}") from exc
+    return str(path)

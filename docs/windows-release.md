@@ -22,7 +22,7 @@ python -m venv build/release-venv
 需要分步调试或使用兼容的替换 Qt 库时，命令为：
 
 ```powershell
-python -m pip install -r requirements-build.txt
+python -m pip install --disable-pip-version-check --no-input --progress-bar off -r requirements-build.txt
 python -m pip check
 $env:QT_QPA_PLATFORM = 'offscreen'
 python -m unittest discover -s tests -t . -p 'test_*.py' -v
@@ -49,6 +49,7 @@ ZIP 生成后立即解压，并验证：
 
 - 源码与打包版的真实 Windows Shell 快捷方式添加、更新、移除。
 - 单文件、多文件、中文与空格路径，以及从其他工作目录启动时的程序目录配置。
+- 快捷方式在英文 Windows 环境下使用 Unicode 接口保存；测试覆盖中文、emoji 和引号路径。
 - 关闭翻译时原有字幕排版保持有效，输入 JSON 不变。
 - 解压后的 EXE 旁没有配置或密钥，中文标记为 `zho`，使用默认设置完成繁转简。
 - 默认中文测试的 PATH 无 Python、FFmpeg 或 ffprobe；工作目录中的无效配置被忽略。
