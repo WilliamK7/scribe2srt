@@ -15,7 +15,9 @@ from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication, QLineEdit
 
 from api.translation_client import TranslationError
+from core.async_chunk_processor import AsyncChunkProcessor, ChunkProcessorTask
 from core.config import DEFAULT_TRANSLATION_SETTINGS
+from core.transcription_cache import transcription_cache_path
 from core.translation import translation_cache_path
 from core.worker import Worker
 from ui.main_window import MainWindow
@@ -64,13 +66,13 @@ class WorkerTests(unittest.TestCase):
         with patch.object(worker.client, "prepare_upload_task", side_effect=AssertionError("No transcription")):
             worker.run()
             worker._cleanup_chunks(force_cleanup=True)
-            worker._cleanup_temporary_json_files()
+            worker._cleanup_transcription_cache()
         self.assertEqual(len(finished), 1)
         self.assertEqual(errors, [])
         self.assertEqual(source.read_bytes(), original)
         self.assertIn("妈妈说话。", source.with_suffix(".srt").read_text(encoding="utf-8"))
 
-    def test_single_media_preserves_raw_json(self):
+    def test_single_media_outputs_only_srt(self):
         data = transcript("jpn", ["體育。", "楽しい。"])  # Japanese original must not be simplified.
         raw = copy.deepcopy(data)
         self.settings = {"translation_api_key": "fake-test-key"}
@@ -82,10 +84,39 @@ class WorkerTests(unittest.TestCase):
             worker.run()
         self.assertEqual(errors, [])
         self.assertEqual(len(finished), 1)
-        self.assertEqual(json.loads(self.source.with_suffix(".json").read_text(encoding="utf-8")), raw)
+        self.assertEqual({path.name for path in self.source.parent.iterdir()},
+                         {self.source.name, self.source.with_suffix(".srt").name})
         self.assertEqual(data, raw)
         self.assertIn("體育。", self.source.with_suffix(".srt").read_text(encoding="utf-8"))
         self.assertTrue(self.source.exists())
+
+    def test_media_processing_preserves_existing_json(self):
+        existing_json = self.source.with_suffix(".json")
+        original = b"existing user data"
+        existing_json.write_bytes(original)
+        worker = self.worker()
+        worker.total_chunks = 1
+        worker.temp_chunks = [str(self.source)]
+        finished, errors = self.signals(worker)
+        worker.on_upload_finished(transcript())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(existing_json.read_bytes(), original)
+        self.assertTrue(self.source.with_suffix(".srt").exists())
+
+    def test_async_chunk_processing_does_not_write_json(self):
+        processor = AsyncChunkProcessor()
+        task = ChunkProcessorTask(0, str(self.source), 30.0, "auto", False, False, 1, processor)
+        completed, errors = [], []
+        task.signals.chunk_completed.connect(lambda index, data: completed.append(data))
+        task.signals.chunk_failed.connect(lambda index, message: errors.append(message))
+        with patch("core.async_chunk_processor.ElevenLabsSTTClient"), \
+             patch.object(task, "_execute_upload_sync", return_value=transcript()):
+            task.run()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]["words"][0]["start"], 30.0)
+        self.assertEqual(list(self.source.parent.iterdir()), [self.source])
 
     def test_translation_failure_and_retry_skip_transcription_even_if_audio_is_missing(self):
         self.settings = {"translation_api_key": "fake-test-key"}
@@ -99,6 +130,8 @@ class WorkerTests(unittest.TestCase):
             worker._finalize_task()
         self.assertEqual(len(errors), 1)
         self.assertEqual(finished, [])
+        self.assertTrue(Path(transcription_cache_path(self.source)).exists())
+        self.assertFalse(self.source.with_suffix(".json").exists())
         state = worker.get_state()
         self.assertTrue(state["transcript_ready"])
         self.assertEqual(state["stage"], "subtitles")
@@ -110,16 +143,25 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(len(done), 1)
         self.assertFalse(os.path.exists(translation_cache_path(self.source)))
+        self.assertFalse(os.path.exists(transcription_cache_path(self.source)))
 
     def test_reselect_media_with_checkpoint_restores_saved_json(self):
-        self.source.with_suffix(".json").write_text(json.dumps(transcript()), encoding="utf-8")
-        Path(translation_cache_path(self.source)).write_text('{"schema":1,"batches":{}}', encoding="utf-8")
-        worker = self.worker()
-        finished, errors = self.signals(worker)
-        with patch.object(worker, "_run_transcription", side_effect=AssertionError("No retranscription")):
-            worker.run()
-        self.assertEqual(errors, [])
-        self.assertEqual(len(finished), 1)
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                checkpoint = self.source.with_suffix(".json") if legacy else Path(transcription_cache_path(self.source))
+                original = json.dumps(transcript())
+                checkpoint.write_text(original, encoding="utf-8")
+                if legacy:
+                    Path(translation_cache_path(self.source)).write_text('{"schema":1,"batches":{}}', encoding="utf-8")
+                worker = self.worker()
+                finished, errors = self.signals(worker)
+                with patch.object(worker, "_run_transcription", side_effect=AssertionError("No retranscription")):
+                    worker.run()
+                self.assertEqual(errors, [])
+                self.assertEqual(len(finished), 1)
+                self.assertFalse(os.path.exists(transcription_cache_path(self.source)))
+                if legacy:
+                    self.assertEqual(checkpoint.read_text(encoding="utf-8"), original)
 
     def test_segmented_completion_uses_common_pipeline_and_can_resume(self):
         self.settings = {"translation_api_key": "fake-test-key"}
@@ -136,7 +178,16 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertEqual(worker.current_chunk_index, 2)
         self.assertTrue(worker.get_state()["transcript_ready"])
-        self.assertEqual(json.loads(self.source.with_suffix(".json").read_text(encoding="utf-8")), combined)
+        self.assertEqual(json.loads(Path(transcription_cache_path(self.source)).read_text(encoding="utf-8")), combined)
+        restored = self.worker(restore_state=worker.get_state())
+        finished, failures = self.signals(restored)
+        with patch.object(restored, "_run_transcription", side_effect=AssertionError("No retranscription")), \
+             patch("core.subtitle_pipeline.QwenTranslationClient", return_value=FakeClient()):
+            restored.run()
+        self.assertEqual(failures, [])
+        self.assertEqual(len(finished), 1)
+        self.assertEqual({path.name for path in self.source.parent.iterdir()},
+                         {self.source.name, self.source.with_suffix(".srt").name})
 
     def test_cancellation_emits_once_and_discards_late_upload(self):
         worker = self.worker()
@@ -244,11 +295,10 @@ class WindowTests(unittest.TestCase):
         self.assertIn("7 / 25", self.window.progress_label.text())
         self.assertTrue(self.window.subtitle_progress_bar.isVisible())
 
-    def test_video_with_translation_checkpoint_skips_audio_extraction(self):
+    def test_video_with_transcription_checkpoint_skips_audio_extraction(self):
         source = Path(self.directory.name, "resume.mp4")
         source.write_bytes(b"video-test")
-        source.with_suffix(".json").write_text(json.dumps(transcript()), encoding="utf-8")
-        Path(translation_cache_path(source)).write_text('{"schema":1,"batches":{}}', encoding="utf-8")
+        Path(transcription_cache_path(source)).write_text(json.dumps(transcript()), encoding="utf-8")
         self.window.ffmpeg_available = True
         with patch("ui.main_window.extract_audio", side_effect=AssertionError("No extraction")), \
              patch.object(self.window, "_execute_transcription_task") as execute:

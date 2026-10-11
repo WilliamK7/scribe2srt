@@ -16,7 +16,7 @@ from api.client import ElevenLabsSTTClient
 from .subtitle_pipeline import process_subtitles
 from .atomic_io import atomic_write_text
 from .cancellation import CancellationToken
-from .translation import translation_cache_path
+from .transcription_cache import transcription_cache_path, resumable_transcription_path
 from .async_chunk_processor import AsyncChunkProcessor
 
 class Worker(QObject):
@@ -142,15 +142,12 @@ class Worker(QObject):
                 self.log_message.emit("复用已完成的转录，恢复字幕处理阶段...")
                 self._finalize_task()
                 return
-            # A remaining translation checkpoint signals an unfinished subtitle stage.
-            transcript_path = os.path.splitext(self.original_file_path)[0] + ".json"
-            if (os.path.exists(translation_cache_path(self.original_file_path))
-                    and os.path.exists(transcript_path)
-                    and os.path.getmtime(transcript_path) >= os.path.getmtime(self.original_file_path)):
+            transcript_path = resumable_transcription_path(self.original_file_path)
+            if transcript_path:
                 with open(transcript_path, encoding="utf-8") as handle:
                     self.combined_transcript = json.load(handle)
                 self.transcript_ready = True
-                self.log_message.emit("检测到翻译进度，复用已保存的转录 JSON。")
+                self.log_message.emit("检测到未完成的字幕任务，复用转录缓存。")
                 self._finalize_task()
                 return
             self._run_transcription()
@@ -574,17 +571,6 @@ class Worker(QObject):
             return
         self.log_message.emit(f"片段 {self.current_chunk_index + 1}/{self.total_chunks} 转录成功。")
         
-        # 保存分段的 JSON 文件以供调试
-        try:
-            chunk_path = self.temp_chunks[self.current_chunk_index]
-            base_chunk_path, _ = os.path.splitext(chunk_path)
-            segment_json_path = base_chunk_path + ".json"
-            with open(segment_json_path, 'w', encoding='utf-8') as f:
-                json.dump(transcript_json, f, ensure_ascii=False, indent=4)
-            self.log_message.emit(f"分段转录JSON已保存到: {os.path.basename(segment_json_path)}")
-        except Exception as e:
-            self.log_message.emit(f"警告：保存分段JSON文件失败: {e}")
-
         if not self.combined_transcript:
             self.combined_transcript = transcript_json
         else:
@@ -608,7 +594,7 @@ class Worker(QObject):
         self._fail(f"处理片段 {self.current_chunk_index + 1}/{self.total_chunks} 时出错: {error_message}")
 
     def _finalize_task(self):
-        """Persist raw transcription before the common cancellable subtitle stage."""
+        """Keep a temporary checkpoint until the subtitle stage succeeds."""
         if self._terminal:
             return
         self.transcript_ready = True
@@ -616,10 +602,9 @@ class Worker(QObject):
         try:
             self.cancellation.check()
             if not self.is_json_input:
-                output_json_path = os.path.splitext(self.original_file_path)[0] + ".json"
-                atomic_write_text(output_json_path, json.dumps(self.combined_transcript,
+                checkpoint_path = transcription_cache_path(self.original_file_path)
+                atomic_write_text(checkpoint_path, json.dumps(self.combined_transcript,
                                   ensure_ascii=False, indent=4), self.cancellation)
-                self.log_message.emit(f"原始转录 JSON 已保存到:\n{output_json_path}")
             process_subtitles(
                 self.combined_transcript, self.original_file_path,
                 settings={**(self.subtitle_settings or {}), **self.translation_settings},
@@ -631,7 +616,7 @@ class Worker(QObject):
                 rate_limiter=self.translation_rate_limiter,
             )
             if not self.is_json_input:
-                self._cleanup_temporary_json_files()
+                self._cleanup_transcription_cache()
                 self._cleanup_chunks(force_cleanup=True)
             self._terminal = True
             self.finished.emit("任务成功完成！")
@@ -643,34 +628,16 @@ class Worker(QObject):
             self._terminal = True
             self.error.emit(message)
 
-    def _cleanup_temporary_json_files(self):
-        """清理单文件处理模式下的冗余临时JSON文件"""
+    def _cleanup_transcription_cache(self):
+        """Remove the temporary checkpoint after successfully saving subtitles."""
         if self.is_json_input:
             return
-        if self.total_chunks == 1:
-            # 单文件处理模式：检查是否需要清理临时JSON文件
-            try:
-                chunk_path = self.temp_chunks[0]
-                base_chunk_path, _ = os.path.splitext(chunk_path)
-                temp_json_path = base_chunk_path + ".json"
-
-                # 计算最终JSON文件路径
-                base_path, _ = os.path.splitext(self.original_file_path)
-                final_json_path = base_path + ".json"
-
-                # 只有当临时JSON文件路径与最终JSON文件路径不同时才删除
-                if (os.path.exists(temp_json_path) and
-                    os.path.abspath(temp_json_path) != os.path.abspath(final_json_path)):
-                    os.remove(temp_json_path)
-                    self.log_message.emit(f"已清理临时JSON文件: {os.path.basename(temp_json_path)}")
-                elif os.path.abspath(temp_json_path) == os.path.abspath(final_json_path):
-                    self.log_message.emit("单文件模式：临时JSON文件即为最终文件，无需清理")
-
-            except (OSError, IndexError) as e:
-                self.log_message.emit(f"清理临时JSON文件时出错: {e}")
-        else:
-            # 多片段处理模式：保留临时JSON文件用于调试
-            self.log_message.emit("多片段处理模式：保留临时JSON文件用于调试")
+        try:
+            os.remove(transcription_cache_path(self.original_file_path))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            self.log_message.emit(f"字幕已保存，转录缓存未能清理：{exc}")
 
     def request_cancellation(self):
         """请求取消当前任务。"""
@@ -714,13 +681,6 @@ class Worker(QObject):
                     if chunk_path and os.path.exists(chunk_path):
                         os.remove(chunk_path)
                         self.log_message.emit(f"已删除临时片段: {os.path.basename(chunk_path)}")
-
-                    # 同时删除对应的JSON文件
-                    if chunk_path:
-                        json_path = os.path.splitext(chunk_path)[0] + ".json"
-                        if os.path.exists(json_path):
-                            os.remove(json_path)
-                            self.log_message.emit(f"已删除片段JSON: {os.path.basename(json_path)}")
 
                 except (OSError, TypeError) as e:
                     chunk_name = os.path.basename(chunk_path) if chunk_path else "未知文件"

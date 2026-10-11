@@ -125,6 +125,7 @@ dmypy.json
 .vscode/
 .idea/
 
-# Local credentials and resumable subtitle translations
+# Local credentials and resumable subtitle checkpoints
 /settings.json
+*.transcription-cache.json
 *.translation-cache.json

@@ -5,8 +5,6 @@
 实现音频片段的并发上传和转录处理
 """
 
-import os
-import json
 import time
 from typing import List, Dict, Any, Optional, Callable
 from PySide6.QtCore import QObject, Signal, QMutex, QMutexLocker, QSemaphore, QRunnable, QEventLoop, QTimer
@@ -84,9 +82,6 @@ class ChunkProcessorTask(QRunnable):
                         word["start"] = round(word["start"] + self.time_offset, 3)
                         word["end"] = round(word["end"] + self.time_offset, 3)
 
-                    # 保存分段JSON文件
-                    self._save_chunk_json(transcript_json)
-
                     # 发送完成信号
                     self.signals.chunk_completed.emit(self.chunk_index, transcript_json)
                     return
@@ -149,16 +144,6 @@ class ChunkProcessorTask(QRunnable):
             raise Exception(error['message'])
         else:
             raise Exception("上传超时或被取消")
-
-    def _save_chunk_json(self, transcript_json: dict):
-        """保存分段JSON文件"""
-        try:
-            base_chunk_path, _ = os.path.splitext(self.chunk_path)
-            segment_json_path = base_chunk_path + ".json"
-            with open(segment_json_path, 'w', encoding='utf-8') as f:
-                json.dump(transcript_json, f, ensure_ascii=False, indent=4)
-        except Exception:
-            pass  # 忽略保存错误
 
 
 class AsyncChunkProcessor(QObject):

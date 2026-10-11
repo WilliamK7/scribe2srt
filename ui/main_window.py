@@ -26,7 +26,7 @@ from core.worker import Worker
 from core.ffmpeg_utils import is_ffmpeg_available, extract_audio, get_media_info
 from api.translation_client import RequestRateLimiter
 from core.atomic_io import atomic_write_text
-from core.translation import translation_cache_path
+from core.transcription_cache import resumable_transcription_path
 from core.launch import absolute_path, path_key
 from core.windows_integration import add_send_to_shortcut, remove_send_to_shortcut, IntegrationError
 from .widgets import CustomCheckBox
@@ -599,9 +599,7 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("准备中...")
         self.progress_label.setVisible(True)
 
-        transcript_path = os.path.splitext(source_file)[0] + ".json"
-        if (os.path.exists(translation_cache_path(source_file)) and os.path.exists(transcript_path)
-                and os.path.getmtime(transcript_path) >= os.path.getmtime(source_file)):
+        if resumable_transcription_path(source_file):
             self._execute_transcription_task(source_file, source_file)
             return
 
