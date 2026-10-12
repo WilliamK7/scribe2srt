@@ -6,33 +6,63 @@ README、无密钥配置示例、第三方声明及许可证目录，根目录�
 
 ## 本地构建
 
-使用 Windows、Python 3.11 x64 和一个独立虚拟环境。普通源码安装仍使用
-`requirements.txt`，发布环境使用包含传递依赖的 `requirements-build.txt`。
-不要从 Python 3.14 环境导出发布依赖。
+使用 Windows x64 和 uv 0.13.0。`pyproject.toml` 与 `uv.lock` 是依赖来源，
+`.python-version` 固定标准 CPython 3.15.0；uv 管理解释器和项目 `.venv`。
+普通源码环境通过 `uv sync --locked` 仅安装运行依赖；发布环境显式加入 `build` 组。
 
 ```powershell
-python -m venv build/release-venv
-./scripts/build_windows.ps1 -Python ./build/release-venv/Scripts/python.exe
+uv --version
+./scripts/build_windows.ps1
 ```
 
 脚本检查每个原生命令的退出码，失败立即停止。构建使用独立目录，避免混入旧 EXE。
+可用 `-Uv C:\tools\uv.exe` 指定 uv。`-Python` 参数已移除。
+已有环境不符合版本时 uv 会重建它；迁移前关闭程序，迁移后重新添加“发送到”快捷方式。
 本地默认包名使用 HEAD 的短 SHA；需要正式版本名时显式传入 `-ArtifactId v0.4.0`。
 本地同名包仅在新的验证全部成功后替换。正式附件必须来自成功的标签工作流。
 
 需要分步调试或使用兼容的替换 Qt 库时，命令为：
 
 ```powershell
-python -m pip install --disable-pip-version-check --no-input --progress-bar off -r requirements-build.txt
-python -m pip check
+uv sync --locked --group build
+uv run --locked --no-sync --group build python scripts/release_environment.py
+uv run --locked --no-sync --group build python scripts/export_requirements.py --check
+$releasePython = uv run --locked --no-sync --group build python -c "import sys; print(sys.executable)"
+uv pip check --python $releasePython
 $env:QT_QPA_PLATFORM = 'offscreen'
-python -m unittest discover -s tests -t . -p 'test_*.py' -v
-python -m PyInstaller --noconfirm --onefile --windowed --noconsole --name Scribe2SRT --collect-data opencc --additional-hooks-dir scripts/hooks --specpath build app.py
-python scripts/package_windows.py --executable dist/Scribe2SRT.exe --artifact-id v0.4.0
+uv run --locked --no-sync --group build python -m unittest discover -s tests -t . -p 'test_*.py' -v
+uv run --locked --no-sync --group build python -m PyInstaller --noconfirm --onefile --windowed --noconsole --name Scribe2SRT --collect-data opencc --additional-hooks-dir scripts/hooks --specpath build app.py
+uv run --locked --no-sync --group build python scripts/package_windows.py --executable dist/Scribe2SRT.exe --artifact-id v0.4.0
 ```
 
 每条命令成功后再执行下一条。`QT_QPA_PLATFORM=offscreen` 仅用于测试，不写入产品配置。
 使用替换 Qt/PySide 库重新构建时，在安装步骤换成自己的兼容构建，并直接运行
 PyInstaller；官方发布的打包脚本会核对固定版本，不能用于变更依赖后的非官方包。
+
+两份 requirements 为 pip 兼容入口：`requirements.txt` 仅含运行依赖，
+`requirements-build.txt` 包含运行和构建依赖。导出使用
+`uv export --locked --no-emit-project --no-hashes --no-annotate`，脚本统一生成说明并保留平台条件。
+禁止手工编辑；本地构建和 CI 均比较两份文件与锁文件的导出结果，不同步即停止。
+
+升级依赖时运行 `uv lock --upgrade`，核对稳定版本并更新直接依赖下限，随后运行：
+
+```powershell
+uv run --locked python scripts/export_requirements.py
+uv run --locked python scripts/export_requirements.py --check
+```
+
+保留 pip 安装方式，使用独立的标准 CPython 3.15.0 虚拟环境：
+
+```powershell
+python -m venv build/pip-venv
+./build/pip-venv/Scripts/python.exe -m pip install -r requirements.txt
+./build/pip-venv/Scripts/python.exe -m pip check
+$env:QT_QPA_PLATFORM = 'offscreen'
+./build/pip-venv/Scripts/python.exe -m unittest discover -s tests -t . -p 'test_*.py' -v
+./build/pip-venv/Scripts/python.exe app.py
+```
+
+该入口仅安装运行依赖，构建许可证解析测试会提示需要 `build` 组；正式构建必须运行完整测试。
 
 `--collect-data opencc` 收集本地字典。Qt GUI 钩子保持普通桌面组件并排除本程序
 不使用的 Qt Virtual Keyboard 和 PDF 图片插件。打包检查实际 EXE 的 OpenCC
@@ -41,22 +71,27 @@ PyInstaller；官方发布的打包脚本会核对固定版本，不能用于变
 ## 验证 ZIP
 
 `package_windows.py` 明确暂存 EXE、README、`settings.example.json` 和第三方声明，
-从固定依赖环境复制原始 LICENSE/NOTICE。Qt、Python、OpenSSL、zlib、Expat 官方材料
+从固定依赖环境复制原始 LICENSE/NOTICE。使用 `packaging.Requirement` 解析导出的注释、
+规范化包名和环境条件，仅检查当前平台适用的精确版本；缺包、版本不同或缺许可证均失败。
+Qt、Python、OpenSSL、zlib/zlib-ng、Expat 官方材料
 及 SHA-256 记录在 `third_party/`；正常打包只校验和复制本地材料，不联网下载许可证。
 每次构建记录实际运行时和 wheel 版本，缺少精确匹配的材料或哈希不符会停止打包。
 
 更换 Python 或其内置库版本后，在对应发布环境中显式更新材料：
 
 ```powershell
-python scripts/update_license_sources.py --native-only
+uv run --locked --group build python scripts/update_license_sources.py --native-only
 ```
 
 也可用已有构建的版本清单更新另一套运行时材料：
-`python scripts/update_license_sources.py --native-only --runtime-manifest path/to/licenses/dependency-versions.json`。
+`uv run --locked --group build python scripts/update_license_sources.py --native-only --runtime-manifest path/to/licenses/dependency-versions.json`。
 更新会保留其他版本的材料。修改 Qt 版本后调整脚本中的 Qt 来源版本并运行
-`python scripts/update_license_sources.py`，同时更新 Qt 和当前运行时材料。审查来源、版本及
-文件差异后提交 `third_party/`。CI 的 Python 3.11 补丁版本可能变化；材料不匹配时应执行
-这一步更新，普通打包不会自动联网补齐或退回使用其他版本。
+`uv run --locked --group build python scripts/update_license_sources.py`，同时更新 Qt 和当前运行时材料。
+uv 管理的解释器在 `sys.base_prefix/LICENSE.txt` 提供原始 Python 许可证，打包时直接复制。
+当前 Windows CPython 3.15.0 使用 zlib-ng 2.2.4，另行记录实际 fork 版本及官方 LICENSE.md，
+同时保留 zlib 兼容版本。审查来源、版本及文件差异后提交 `third_party/`。
+CI 读取 `.python-version`，补丁版本不会自动漂移；更新该文件或 uv 的解释器构建来源后，
+应在新环境刷新并核对原生库材料。普通打包不会自动联网补齐或退回使用其他版本。
 
 ZIP 生成后立即解压，并验证：
 
@@ -71,7 +106,7 @@ ZIP 生成后立即解压，并验证：
 快捷方式检查通过隔离目录运行，不改动当前用户的 SendTo 目录。单独运行：
 
 ```powershell
-python tests/send_to_windows_smoke.py --executable dist/Scribe2SRT.exe --send-to-directory build/smoke-sendto
+uv run --locked --group build python tests/send_to_windows_smoke.py --executable build/<本次构建目录>/dist/Scribe2SRT.exe --send-to-directory build/smoke-sendto
 ```
 
 所有应用子进程设置 60 秒上限。超时清理只针对测试启动的 PID 及其子进程。
@@ -138,9 +173,11 @@ API 操作使用相同路径，防止 Fork 默认上游选择导致操作错误�
 | workflow_dispatch | 是，所选分支/标签 | 否 |
 | 本 Fork v* 标签推送 | 是，标签对应提交 | 是 |
 
-构建固定 `windows-2022`、Python 3.11 x64、30 分钟上限，默认 `contents: read`。
+构建固定 `windows-2022`、uv 0.13.0、`.python-version` 中的 CPython x64 和 30 分钟上限，
+默认 `contents: read`。`setup-uv` 固定到 v9.0.0 的提交 SHA，启用 uv 缓存，
+缓存键包含 `pyproject.toml`、`uv.lock` 和 `.python-version`；CI 调用与本地相同的构建脚本。
 发布任务在构建成功后运行，限制 push、v* 标签和本 Fork，单独授予 `contents: write`。
-Action 主版本保留 checkout v4、setup-python v5、artifact v4、action-gh-release v2。
+其他 Action 保留 checkout v4、artifact v4、action-gh-release v2。
 
 ## 失败与重试
 

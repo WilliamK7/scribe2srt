@@ -35,15 +35,30 @@ Scribe2SRT 是一款专业的音视频转字幕工具。通过集成 ElevenLabs 
    ```
 
 2. **安装依赖**
-   推荐 Python 3.11；Windows 发布验证使用 3.11 x64。可先创建独立虚拟环境。
+   使用 [uv](https://docs.astral.sh/uv/getting-started/installation/) 0.13.0。
+   项目固定标准 CPython 3.15.0，uv 会自动下载解释器并创建 `.venv`；Windows 发布使用 x64。
+   已有 Python 时可通过 pip 安装指定版本的 uv：
    ```bash
-   python -m pip install -r requirements.txt
+   python -m pip install uv==0.13.0
+   uv sync --locked
    ```
 
 3. **运行程序**
    ```bash
-   python app.py
+   uv run --locked python app.py
    ```
+
+依赖由 `pyproject.toml` 和 `uv.lock` 管理。默认仅安装运行依赖，构建工具在 `build`
+依赖组中。迁移旧虚拟环境前先关闭程序；环境重建后重新选择“系统集成 → 添加到发送到”。
+
+若已有标准 CPython 3.15.0，也可在独立虚拟环境中使用 pip 安装入口：
+
+```bash
+python -m pip install -r requirements.txt
+python app.py
+```
+
+两份 requirements 均由锁文件自动导出，保留精确版本和平台条件，不能手工维护。
 
 </details>
 
@@ -88,7 +103,7 @@ Scribe2SRT 是一款专业的音视频转字幕工具。通过集成 ElevenLabs 
 也可从命令行调用：
 
 ```powershell
-python app.py --send-to -- "D:\视频 文件\中文.json" "D:\音频\example.mp3"
+uv run --locked python app.py --send-to -- "D:\视频 文件\中文.json" "D:\音频\example.mp3"
 ```
 
 
@@ -137,24 +152,36 @@ API Key 按本机配置明文保存到 `settings.json`，界面遮罩显示且�
 
 ### 验证和打包
 
-自动测试不连接真实服务：
+自动测试不连接真实服务；完整测试包含需要 `build` 依赖组的许可证解析测试：
 
 ```bash
-python -m unittest discover -s tests -t . -p "test_*.py" -v
+uv run --locked --group build python -m unittest discover -s tests -t . -p "test_*.py" -v
 ```
 
-正式 Windows 构建使用精确版本的 `requirements-build.txt`。在 Python 3.11 x64 环境中运行：
+正式 Windows 构建使用 uv 0.13.0、`.python-version` 固定的 CPython 3.15.0 x64
+和 `uv.lock`。在 Windows 下运行：
 
 ```powershell
-./scripts/build_windows.ps1 -Python python
+./scripts/build_windows.ps1
 ```
 
-脚本依次安装固定依赖、检查依赖、运行离线测试、构建 EXE、附带许可证、生成 ZIP，并解压验证后生成 SHA-256。构建收集 OpenCC 数据、Qt Windows 插件和 HTTPS 证书；打包钩子过滤应用未使用的虚拟键盘及 PDF 插件。
+脚本使用 `uv sync --locked --group build`，校验解释器、两份 requirements 导出及依赖，
+从同一环境运行离线测试、构建 EXE、附带许可证、生成 ZIP，并解压验证后生成 SHA-256。
+可用 `-Uv` 指定 uv 可执行文件，用 `-ArtifactId` 指定包名中的版本标签或提交 SHA。
+构建收集 OpenCC 数据、Qt Windows 插件和 HTTPS 证书；打包钩子过滤应用未使用的虚拟键盘及 PDF 插件。
+
+修改依赖后更新锁文件和 pip 导出文件：
+
+```bash
+uv lock --upgrade
+uv run --locked python scripts/export_requirements.py
+uv run --locked python scripts/export_requirements.py --check
+```
 
 Windows 下也可用离线 JSON 单独验证真实 Shell 快捷方式的添加、更新、移除、源码版及打包版的单文件／多文件启动、不同工作目录的配置加载，以及最终 EXE 在无密钥、无 Python/FFmpeg 环境下的默认繁转简：
 
 ```powershell
-python tests/send_to_windows_smoke.py --executable dist/Scribe2SRT.exe --send-to-directory build/smoke-sendto
+uv run --locked --group build python tests/send_to_windows_smoke.py --executable build/<本次构建目录>/dist/Scribe2SRT.exe --send-to-directory build/smoke-sendto
 ```
 
 传入 `--send-to-directory` 时，快捷方式操作全部使用指定隔离目录。省略该选项会临时更新当前用户的本程序快捷方式，并在结束时恢复原内容；同名但不属于本程序的快捷方式会拒绝覆盖。默认配置检查要求被测 EXE 旁没有 `settings.json`。所有应用烟雾测试子进程最多等待 60 秒。

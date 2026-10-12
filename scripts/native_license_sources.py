@@ -12,24 +12,37 @@ import zlib
 
 
 def runtime_versions():
-    return {"Python": sys.version.split()[0], "OpenSSL": ssl.OPENSSL_VERSION.split()[1],
-            "zlib": zlib.ZLIB_VERSION, "Expat": pyexpat.EXPAT_VERSION.removeprefix("expat_")}
+    versions = {"Python": sys.version.split()[0], "OpenSSL": ssl.OPENSSL_VERSION.split()[1],
+                "Expat": pyexpat.EXPAT_VERSION.removeprefix("expat_")}
+    if hasattr(zlib, "ZLIBNG_VERSION"):
+        versions["zlib-ng"] = zlib.ZLIBNG_VERSION
+    else:
+        versions["zlib"] = zlib.ZLIB_RUNTIME_VERSION
+    return versions
 
 
 def inventory_versions(inventory):
-    return {"Python": inventory["python"], "OpenSSL": inventory["openssl"].split()[1],
-            "zlib": inventory["zlib"], "Expat": inventory["expat"]}
+    versions = {"Python": inventory["python"], "OpenSSL": inventory["openssl"].split()[1],
+                "Expat": inventory["expat"]}
+    if inventory.get("zlib_ng"):
+        versions["zlib-ng"] = inventory["zlib_ng"]
+    else:
+        versions["zlib"] = inventory["zlib"]
+    return versions
 
 
 def source_records(versions):
-    if set(versions) != {"Python", "OpenSSL", "zlib", "Expat"} or not all(
+    if set(versions) not in ({"Python", "OpenSSL", "zlib", "Expat"},
+                             {"Python", "OpenSSL", "zlib-ng", "Expat"}) or not all(
             isinstance(version, str) and re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version)
             for version in versions.values()):
         raise ValueError("Unsupported native runtime versions")
     sources = {
         "Python": ("license.rst", f"python/cpython/v{versions['Python']}/Doc/license.rst"),
         "OpenSSL": ("LICENSE.txt", f"openssl/openssl/openssl-{versions['OpenSSL']}/LICENSE.txt"),
-        "zlib": ("LICENSE", f"madler/zlib/v{versions['zlib']}/LICENSE"),
+        **({"zlib-ng": ("LICENSE.md", f"zlib-ng/zlib-ng/{versions['zlib-ng']}/LICENSE.md")}
+           if "zlib-ng" in versions else
+           {"zlib": ("LICENSE", f"madler/zlib/v{versions['zlib']}/LICENSE")}),
         "Expat": ("COPYING", f"libexpat/libexpat/R_{versions['Expat'].replace('.', '_')}/expat/COPYING"),
     }
     return [{"component": component, "version": versions[component],

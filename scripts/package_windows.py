@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import re
 import shutil
-import struct
 import sys
 import tempfile
 import zipfile
@@ -18,6 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from scripts.collect_licenses import collect_licenses
+from scripts.release_environment import validate_release_environment
 from tests.send_to_windows_smoke import run_smoke
 
 
@@ -54,10 +54,7 @@ def inspect_executable(executable):
 
 
 def package(executable, artifact_id, output_directory):
-    if sys.platform != "win32":
-        raise RuntimeError("Windows packaging and shell validation require Windows")
-    if sys.version_info[:2] != (3, 11) or struct.calcsize("P") != 8:
-        raise RuntimeError("Use the Windows x64 Python 3.11 release environment")
+    validate_release_environment()
     if not re.fullmatch(r"(?:v\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?|[0-9a-f]{7,40})", artifact_id):
         raise ValueError("Artifact ID must be a version tag or commit SHA")
     names, native_versions = inspect_executable(executable)

@@ -5,12 +5,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts.native_license_sources import copy_native_licenses, source_records
+from scripts.native_license_sources import copy_native_licenses, inventory_versions, runtime_versions, source_records
 from scripts import update_license_sources
 
 
 class NativeLicenseTests(unittest.TestCase):
-    versions = {"Python": "3.11.17", "OpenSSL": "3.5.9", "zlib": "1.3.2", "Expat": "2.8.5"}
+    versions = {"Python": "3.15.0", "OpenSSL": "3.5.9", "zlib-ng": "2.2.4", "Expat": "2.8.5"}
     other_versions = {"Python": "3.11.9", "OpenSSL": "3.0.13", "zlib": "1.3.1", "Expat": "2.6.0"}
 
     def fixture(self, root):
@@ -71,6 +71,20 @@ class NativeLicenseTests(unittest.TestCase):
                 self.assertEqual((source / path).read_bytes(), content)
             copy_native_licenses(root / "current", self.versions, source)
             copy_native_licenses(root / "previous", self.other_versions, source)
+
+    def test_zlib_ng_inventory_keeps_the_actual_fork_version(self):
+        inventory = {"python": "3.15.0", "openssl": "OpenSSL 3.5.9", "zlib": "1.3.1.zlib-ng",
+                     "zlib_ng": "2.2.4", "expat": "2.8.5"}
+        self.assertEqual(inventory_versions(inventory), self.versions)
+        records = {record["component"]: record for record in source_records(self.versions)}
+        self.assertEqual(records["zlib-ng"]["url"], "https://raw.githubusercontent.com/zlib-ng/zlib-ng/2.2.4/LICENSE.md")
+        self.assertNotIn("zlib", records)
+
+    def test_zlib_ng_runtime_is_distinct_from_its_compatibility_version(self):
+        with patch("scripts.native_license_sources.zlib", ZLIBNG_VERSION="2.2.4", ZLIB_RUNTIME_VERSION="1.3.1.zlib-ng"):
+            versions = runtime_versions()
+        self.assertEqual(versions["zlib-ng"], "2.2.4")
+        self.assertNotIn("zlib", versions)
 
 
 if __name__ == "__main__":

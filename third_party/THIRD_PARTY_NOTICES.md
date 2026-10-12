@@ -49,8 +49,12 @@ the Apache License, version 2.0. Its original LICENSE and the OpenCC
 
 Original wheel license files are copied from the pinned build environment,
 including Requests' NOTICE and PyInstaller's bootloader exception. Python's
-original LICENSE.txt is included for the actual interpreter version. Native
-runtime license sources and their hashes are recorded alongside those files.
+original LICENSE.txt from the uv-managed interpreter is included for the actual
+interpreter version. The Windows CPython 3.15.0 build uses OpenSSL 3.5.9,
+Expat 2.8.5 and zlib-ng 2.2.4 (reporting zlib compatibility 1.3.1.zlib-ng).
+The zlib-ng fork has its own preserved LICENSE.md; its version is recorded
+separately from that compatibility string. Native runtime license sources and
+their hashes are recorded alongside those files.
 Microsoft runtime files retain Microsoft's terms and copyright notices.
 
 The application is a fork of [cylind/scribe2srt](https://github.com/cylind/scribe2srt).

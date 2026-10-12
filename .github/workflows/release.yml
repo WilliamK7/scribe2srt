@@ -26,39 +26,28 @@ jobs:
       - name: Checkout event commit
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11 x64
-        uses: actions/setup-python@v5
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          python-version: '3.11'
-          architecture: x64
-          cache: pip
-          cache-dependency-path: requirements-build.txt
+          version: '0.13.0'
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+            .python-version
 
-      - name: Install pinned build dependencies
+      - name: Install the pinned managed Python
         run: |
-          $ErrorActionPreference = 'Stop'
-          python -m pip install --disable-pip-version-check --no-input --progress-bar off -r requirements-build.txt
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pip check
+          uv python install (Get-Content -LiteralPath .python-version -Raw).Trim() --no-bin --no-registry
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run offline tests
-        run: |
-          python -m unittest discover -s tests -t . -p 'test_*.py' -v
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Build Windows executable
-        run: |
-          python -m PyInstaller --noconfirm --onefile --windowed --noconsole --name Scribe2SRT --collect-data opencc --additional-hooks-dir scripts/hooks --specpath build/ci --distpath build/ci/dist --workpath build/ci/work app.py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Package and validate the extracted ZIP
+      - name: Build, test and validate the Windows ZIP
         id: asset
         run: |
           $ErrorActionPreference = 'Stop'
           $artifactId = $env:GITHUB_SHA.Substring(0, 7)
           if ($env:GITHUB_REF_TYPE -eq 'tag') { $artifactId = $env:GITHUB_REF_NAME }
-          python scripts/package_windows.py --executable build/ci/dist/Scribe2SRT.exe --artifact-id $artifactId
+          ./scripts/build_windows.ps1 -ArtifactId $artifactId
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $assetName = "Scribe2SRT-$artifactId-windows-x86_64.zip"
           foreach ($file in @("dist/releases/$assetName", "dist/releases/$assetName.sha256")) {
@@ -103,6 +92,7 @@ jobs:
 
             - 增加 Qwen-MT 双语字幕、中文本地繁转简和可恢复的转录/翻译缓存。
             - 增加 Windows“发送到”队列，支持中文和空格路径、多个文件及自动退出。
+            - 构建统一使用 uv 0.13.0、Python 3.15.0 和锁定依赖；源码迁移虚拟环境后需重新添加“发送到”快捷方式。
             - 修正字幕时间轴重叠和 HTTP 压缩声明兼容性。
             - 附带配置示例、第三方组件声明、原始许可证及 ZIP 的 SHA-256 校验文件。
 
