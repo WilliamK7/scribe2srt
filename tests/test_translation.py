@@ -495,6 +495,7 @@ class PipelineTests(unittest.TestCase):
             process_subtitles(transcript(), self.source)
         post.assert_not_called()
         self.assertEqual(self.output.read_text(encoding="utf-8"), "EXISTING SRT")
+        self.assertFalse(os.path.exists(translation_cache_path(self.source)))
 
     def test_invalid_json_and_failed_atomic_replace_preserve_destination(self):
         self.output.write_text("EXISTING SRT", encoding="utf-8")

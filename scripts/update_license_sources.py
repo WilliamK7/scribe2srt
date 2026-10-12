@@ -1,19 +1,25 @@
-"""Refresh missing Qt notices from versioned official source repositories.
+"""Refresh Qt and native runtime notices from versioned official sources.
 
-Run deliberately after changing Qt pins, then review and commit the resulting
+Run deliberately after changing dependency versions, then review and commit the resulting
 third_party files. Release builds consume the committed, hash-checked copies.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+import argparse
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import posixpath
+import sys
 import time
 
 import requests
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from scripts.native_license_sources import runtime_versions, inventory_versions, source_records
+
 SOURCES = (("qt", "qtbase", "v6.12.0"), ("qt", "qtsvg", "v6.12.0"),
            ("qt", "qtimageformats", "v6.12.0"), ("qt", "qtdeclarative", "v6.12.0"),
            ("pyside", "pyside-setup", "6.12.0"))
@@ -90,5 +96,32 @@ def refresh():
     print(f"Preserved {len(records)} original Qt/PySide source license and attribution files", flush=True)
 
 
+def refresh_native(versions):
+    manifest_path = ROOT / "third_party" / "native-sources.json"
+    records = {}
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != 1:
+            raise RuntimeError("Unsupported native license manifest schema")
+        records = {(record["component"], record["version"]): record for record in manifest["files"]}
+    for record in source_records(versions):
+        content = fetch(record["url"])
+        destination = ROOT / "third_party" / record["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        record["sha256"] = hashlib.sha256(content).hexdigest()
+        records[(record["component"], record["version"])] = record
+    manifest_path.write_text(json.dumps({"schema": 1, "files": [records[key] for key in sorted(records)]},
+                                        indent=2) + "\n", encoding="utf-8")
+    print(f"Preserved native license inputs for {versions}", flush=True)
+
+
 if __name__ == "__main__":
-    refresh()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--native-only", action="store_true", help="Update native runtime sources without re-fetching Qt sources")
+    parser.add_argument("--runtime-manifest", type=Path, help="Use versions from a release licenses/dependency-versions.json")
+    args = parser.parse_args()
+    if not args.native_only:
+        refresh()
+    versions = inventory_versions(json.loads(args.runtime_manifest.read_text(encoding="utf-8"))) if args.runtime_manifest else runtime_versions()
+    refresh_native(versions)

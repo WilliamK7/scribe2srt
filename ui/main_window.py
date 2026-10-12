@@ -26,7 +26,7 @@ from core.worker import Worker
 from core.ffmpeg_utils import is_ffmpeg_available, extract_audio, get_media_info
 from api.translation_client import RequestRateLimiter
 from core.atomic_io import atomic_write_text
-from core.transcription_cache import resumable_transcription_path
+from core.transcription_cache import transcription_identity, load_transcription_checkpoint
 from core.launch import absolute_path, path_key
 from core.windows_integration import add_send_to_shortcut, remove_send_to_shortcut, IntegrationError
 from .widgets import CustomCheckBox
@@ -584,7 +584,7 @@ class MainWindow(QMainWindow):
             if not os.path.isfile(file_path):
                 raise OSError(f"文件不存在或无法访问：{file_path}")
             if ext.lower() == '.json':
-                self._process_json_file_directly(file_path, from_batch=self.batch_mode)
+                self._process_json_file_directly(file_path)
             else:
                 self._begin_media_processing(file_path)
         except Exception as exc:
@@ -599,8 +599,17 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("准备中...")
         self.progress_label.setVisible(True)
 
-        if resumable_transcription_path(source_file):
-            self._execute_transcription_task(source_file, source_file)
+        options = self._queue_options or self.settings
+        identity = transcription_identity(source_file, options.get("source_language", "auto"),
+                                          options.get("tag_audio_events", False), options["split_duration_min"])
+        checkpoint = load_transcription_checkpoint(source_file, identity)
+        if checkpoint is not None:
+            # Worker verifies the identity again before using this snapshot, so a
+            # source change after this preflight cannot bypass video preparation.
+            self._execute_transcription_task(source_file, source_file, restore_state={
+                "stage": "subtitles", "transcript_ready": True,
+                "combined_transcript": checkpoint, "transcription_identity": identity,
+            })
             return
 
         file_to_process = source_file
@@ -643,7 +652,7 @@ class MainWindow(QMainWindow):
 
         self._execute_transcription_task(file_to_process, source_file)
 
-    def _process_json_file_directly(self, json_path: str, from_batch: bool = False):
+    def _process_json_file_directly(self, json_path: str):
         """Import JSON in the same background worker, skipping transcription."""
         self.log_area.append("检测到 JSON 文件，开始后台字幕处理...")
         self.progress_label.setText("正在处理字幕...")

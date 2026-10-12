@@ -14,9 +14,11 @@ from PySide6.QtCore import QObject, Signal, QThreadPool
 
 from api.client import ElevenLabsSTTClient
 from .subtitle_pipeline import process_subtitles
-from .atomic_io import atomic_write_text
 from .cancellation import CancellationToken
-from .transcription_cache import transcription_cache_path, resumable_transcription_path
+from .transcription_cache import (
+    transcription_cache_path, transcription_identity,
+    load_transcription_checkpoint, save_transcription_checkpoint,
+)
 from .async_chunk_processor import AsyncChunkProcessor
 
 class Worker(QObject):
@@ -53,6 +55,7 @@ class Worker(QObject):
         self.cancellation = CancellationToken()
         self.stage = (restore_state or {}).get("stage", "transcription")
         self.transcript_ready = (restore_state or {}).get("transcript_ready", False)
+        self._transcription_identity = (restore_state or {}).get("transcription_identity")
         self.is_json_input = os.path.splitext(self.original_file_path)[1].lower() == ".json"
         self._terminal = False
         
@@ -127,6 +130,7 @@ class Worker(QObject):
             "extracted_audio_file": getattr(self, 'extracted_audio_file', None),
             "stage": self.stage,
             "transcript_ready": self.transcript_ready,
+            "transcription_identity": self._transcription_identity,
         }
 
     def run(self):
@@ -138,14 +142,17 @@ class Worker(QObject):
                 self.transcript_ready = True
                 self._finalize_task()
                 return
+            current_identity = self._current_transcription_identity()
+            if self.restore_state and self._transcription_identity != current_identity:
+                raise ValueError("源文件或转录参数已变化，不能复用旧任务；请重新选择文件开始处理。")
+            self._transcription_identity = current_identity
             if self.transcript_ready:
                 self.log_message.emit("复用已完成的转录，恢复字幕处理阶段...")
                 self._finalize_task()
                 return
-            transcript_path = resumable_transcription_path(self.original_file_path)
-            if transcript_path:
-                with open(transcript_path, encoding="utf-8") as handle:
-                    self.combined_transcript = json.load(handle)
+            checkpoint = load_transcription_checkpoint(self.original_file_path, current_identity)
+            if checkpoint is not None:
+                self.combined_transcript = checkpoint
                 self.transcript_ready = True
                 self.log_message.emit("检测到未完成的字幕任务，复用转录缓存。")
                 self._finalize_task()
@@ -153,6 +160,10 @@ class Worker(QObject):
             self._run_transcription()
         except Exception as exc:
             self._fail(f"处理文件失败: {exc}")
+
+    def _current_transcription_identity(self):
+        return transcription_identity(self.original_file_path, self.language_code,
+                                      self.tag_audio_events, self.split_duration_sec / 60)
 
     def _run_transcription(self):
         """任务执行的入口点。"""
@@ -602,9 +613,12 @@ class Worker(QObject):
         try:
             self.cancellation.check()
             if not self.is_json_input:
-                checkpoint_path = transcription_cache_path(self.original_file_path)
-                atomic_write_text(checkpoint_path, json.dumps(self.combined_transcript,
-                                  ensure_ascii=False, indent=4), self.cancellation)
+                current_identity = self._current_transcription_identity()
+                if self._transcription_identity is not None and self._transcription_identity != current_identity:
+                    raise ValueError("源文件或转录参数在处理期间发生变化，请重新选择文件开始处理。")
+                self._transcription_identity = current_identity
+                save_transcription_checkpoint(self.original_file_path, current_identity,
+                                              self.combined_transcript, self.cancellation)
             process_subtitles(
                 self.combined_transcript, self.original_file_path,
                 settings={**(self.subtitle_settings or {}), **self.translation_settings},

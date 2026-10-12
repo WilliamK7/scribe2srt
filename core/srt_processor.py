@@ -302,18 +302,6 @@ class SrtProcessor:
             )
         return "\n".join(srt_lines)
 
-    def _generate_final_srt_content(self, entries: List[Dict]) -> str:
-        """
-        Generate final SRT content with optimized display formatting
-        
-        Args:
-            entries: List of optimized subtitle entries
-            
-        Returns:
-            Final SRT content string
-        """
-        return self.render_entries(self._finalize_entries(entries))
-    
     def _optimize_text_display(self, text: str) -> str:
         """
         Optimize text display format: prioritize single line, break at punctuation if needed

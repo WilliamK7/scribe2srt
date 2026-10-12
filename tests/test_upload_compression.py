@@ -1,6 +1,7 @@
 """Exercise Requests' real upload/decompression path without external services."""
 
 import gzip
+import gc
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -22,6 +23,9 @@ class UploadCompressionTests(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def test_uploader_advertises_supported_encodings_and_decodes_gzip_json(self):
+        # Earlier GUI tests leave Python reference cycles. Collect them on the
+        # Qt thread before HTTP server threads can trigger garbage collection.
+        gc.collect()
         observed = []
         transcription = {"language_code": "zho", "text": "繁體字幕", "words": []}
 

@@ -113,13 +113,6 @@ class TranslationCache:
                 atomic_write_text(self.path, json.dumps(self.data, ensure_ascii=False, indent=2))
         cancellation.commit(save)
 
-    def checkpoint(self, cancellation):
-        """An empty checkpoint also allows a failed configuration to reuse transcription."""
-        def save():
-            with self._lock:
-                atomic_write_text(self.path, json.dumps(self.data, ensure_ascii=False, indent=2))
-        cancellation.commit(save)
-
     def clear(self):
         with self._lock:
             try:

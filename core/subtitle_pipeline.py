@@ -40,7 +40,6 @@ def process_subtitles(json_data, source_path, settings=None, selected_language="
             entries = [replace(entry, text=simplify(entry.text)) for entry in entries]
             progress(len(entries), len(entries))
         else:
-            cache.checkpoint(cancellation)
             config = TranslationSettings.from_dict(settings)
             config.validate(require_key=False)
             log(f"开始翻译 {len(entries)} 条字幕，模型 {config.model}，每批最多 {config.batch_size} 条。")

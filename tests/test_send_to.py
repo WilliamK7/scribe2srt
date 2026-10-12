@@ -538,10 +538,9 @@ class ShortcutTests(unittest.TestCase):
     def test_same_named_foreign_shortcut_is_not_overwritten_or_removed(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary, integration.SHORTCUT_NAME)
-            integration._run_powershell(
-                "$shell = New-Object -ComObject WScript.Shell\n"
-                f"$shortcut = $shell.CreateShortcut({integration._ps_string(path)})\n"
-                "$shortcut.TargetPath = 'notepad.exe'\n$shortcut.Description = 'Another program'\n$shortcut.Save()\n")
+            with integration.ShellLink() as link:
+                link.configure(integration.ShortcutSpec(sys.executable, "", temporary), "Another program")
+                link.save(path)
             with self.assertRaises(integration.IntegrationError):
                 integration.add_send_to_shortcut(temporary)
             with self.assertRaises(integration.IntegrationError):

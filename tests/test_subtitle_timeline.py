@@ -138,7 +138,6 @@ class TimelineTests(unittest.TestCase):
         empty = transcript()
         self.assertEqual(SrtProcessor(empty).create_entries(), [])
         self.assertEqual(create_srt_from_json(empty), "")
-        self.assertEqual(SrtProcessor(empty)._generate_final_srt_content([]), "")
         for end in (2.0, 1.0, 0.5, 1.0004):
             with self.subTest(end=end):
                 _, cues = self.check_entries(transcript(("(one)", 1, end, "audio_event")))
@@ -160,13 +159,11 @@ class TimelineTests(unittest.TestCase):
                           ("(first)", 0, 2, "audio_event"),
                           ("(also first)", 0.0004, 4, "audio_event"))
         processor = SrtProcessor(data)
-        raw_entries = [dict(word, is_audio_event=True) for word in data["words"]]
-        original = copy.deepcopy(raw_entries)
+        original = copy.deepcopy(data)
         content = processor.create_srt()
         self.assertEqual(create_srt_from_json(data), content)
         self.assertEqual(processor.render_entries(processor.create_entries()), content)
-        self.assertEqual(processor._generate_final_srt_content(raw_entries), content)
-        self.assertEqual(raw_entries, original)
+        self.assertEqual(data, original)
         self.assertEqual(self.assert_valid_srt(content),
                          [(0, 917, "(first) (also first)"), (1000, 3000, "(last)")])
 

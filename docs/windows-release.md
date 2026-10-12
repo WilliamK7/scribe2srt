@@ -41,9 +41,22 @@ PyInstaller；官方发布的打包脚本会核对固定版本，不能用于变
 ## 验证 ZIP
 
 `package_windows.py` 明确暂存 EXE、README、`settings.example.json` 和第三方声明，
-从固定依赖环境复制原始 LICENSE/NOTICE。Qt 官方源文件的副本及 SHA-256 记录在
-`third_party/`，修改 Qt 版本后运行 `python scripts/update_license_sources.py`，
-审查生成的文件再提交。每次构建还记录实际 Python、OpenSSL、zlib 和 wheel 版本。
+从固定依赖环境复制原始 LICENSE/NOTICE。Qt、Python、OpenSSL、zlib、Expat 官方材料
+及 SHA-256 记录在 `third_party/`；正常打包只校验和复制本地材料，不联网下载许可证。
+每次构建记录实际运行时和 wheel 版本，缺少精确匹配的材料或哈希不符会停止打包。
+
+更换 Python 或其内置库版本后，在对应发布环境中显式更新材料：
+
+```powershell
+python scripts/update_license_sources.py --native-only
+```
+
+也可用已有构建的版本清单更新另一套运行时材料：
+`python scripts/update_license_sources.py --native-only --runtime-manifest path/to/licenses/dependency-versions.json`。
+更新会保留其他版本的材料。修改 Qt 版本后调整脚本中的 Qt 来源版本并运行
+`python scripts/update_license_sources.py`，同时更新 Qt 和当前运行时材料。审查来源、版本及
+文件差异后提交 `third_party/`。CI 的 Python 3.11 补丁版本可能变化；材料不匹配时应执行
+这一步更新，普通打包不会自动联网补齐或退回使用其他版本。
 
 ZIP 生成后立即解压，并验证：
 

@@ -3,3 +3,4 @@
 
 # Preserve original third-party notices byte-for-byte for their recorded hashes.
 third_party/licenses/** -text
+third_party/native-licenses/** -text

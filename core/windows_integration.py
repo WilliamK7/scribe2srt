@@ -38,10 +38,6 @@ def shortcut_spec() -> ShortcutSpec:
         [str(directory / "app.py"), "--send-to", "--"]), str(directory))
 
 
-def _ps_string(value) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
 def _run_powershell(script: str) -> str:
     if sys.platform != "win32":
         raise IntegrationError("“发送到”集成仅支持 Windows。")
